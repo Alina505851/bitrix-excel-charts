@@ -1,0 +1,144 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f1f4f9;
+  --foreground: #0f172a;
+  --app-accent: 14 165 233;
+  --surface-elevated: 255 255 255;
+  --ring-focus: rgb(14 165 233 / 0.38);
+  --surface-glass: rgb(255 255 255 / 0.72);
+  --border-hairline: rgb(15 23 42 / 0.06);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #08080a;
+    --foreground: #f4f4f5;
+    --surface-elevated: 24 24 27;
+    --ring-focus: rgb(56 189 248 / 0.42);
+    --surface-glass: rgb(24 24 27 / 0.78);
+    --border-hairline: rgb(255 255 255 / 0.08);
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+  font-feature-settings: "kern" 1, "liga" 1;
+}
+
+/** Фон: спокойный mesh, чуть глубже по центру */
+.app-shell-bg {
+  background-color: #eef2f8;
+  background-image:
+    radial-gradient(ellipse 100% 70% at 50% -18%, rgb(186 230 253 / 0.5), transparent 55%),
+    radial-gradient(ellipse 90% 55% at 0% 0%, rgb(207 250 254 / 0.45), transparent 50%),
+    radial-gradient(ellipse 85% 50% at 100% 0%, rgb(221 214 254 / 0.42), transparent 48%),
+    radial-gradient(ellipse 70% 45% at 8% 100%, rgb(167 243 208 / 0.28), transparent 50%),
+    radial-gradient(ellipse 60% 40% at 96% 92%, rgb(251 207 232 / 0.22), transparent 45%),
+    linear-gradient(180deg, #f0f5fb 0%, #f6f8fc 38%, #eef1f7 100%);
+}
+
+@media (prefers-color-scheme: dark) {
+  .app-shell-bg {
+    background-color: #060608;
+    background-image:
+      radial-gradient(ellipse 90% 58% at 50% -15%, rgb(8 145 178 / 0.18), transparent 52%),
+      radial-gradient(ellipse 80% 48% at 12% 6%, rgb(59 130 246 / 0.12), transparent 50%),
+      radial-gradient(ellipse 75% 44% at 94% 4%, rgb(139 92 246 / 0.14), transparent 48%),
+      radial-gradient(ellipse 55% 36% at 4% 88%, rgb(16 185 129 / 0.08), transparent 45%),
+      radial-gradient(ellipse 50% 34% at 98% 90%, rgb(236 72 153 / 0.07), transparent 42%),
+      linear-gradient(180deg, #08080c 0%, #0f0f14 45%, #0a0a0e 100%);
+  }
+}
+
+/** Карточка со стеклом — комбинируется с Tailwind */
+.glass-surface {
+  background: var(--surface-glass);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border-hairline);
+  box-shadow:
+    0 1px 0 rgb(255 255 255 / 0.55) inset,
+    0 24px 48px -28px rgb(15 23 42 / 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  .glass-surface {
+    box-shadow:
+      0 1px 0 rgb(255 255 255 / 0.04) inset,
+      0 28px 56px -26px rgb(0 0 0 / 0.55);
+  }
+}
+
+:focus-visible {
+  outline: 2px solid var(--ring-focus);
+  outline-offset: 2px;
+}
+
+::selection {
+  background-color: rgb(14 165 233 / 0.22);
+}
+
+@media (prefers-color-scheme: dark) {
+  ::selection {
+    background-color: rgb(56 189 248 / 0.25);
+  }
+}
+
+/** Пропуск к основному содержимому — виден только при фокусе с клавиатуры */
+.skip-link {
+  position: absolute;
+  left: 1rem;
+  top: 1rem;
+  z-index: 9999;
+  padding: 0.65rem 1rem;
+  border-radius: 0.75rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #0f172a;
+  background: #fff;
+  box-shadow:
+    0 0 0 2px rgb(14 165 233 / 0.45),
+    0 12px 32px -8px rgb(15 23 42 / 0.25);
+  transform: translateY(calc(-100% - 2rem));
+  opacity: 0;
+  pointer-events: none;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.skip-link:focus-visible {
+  transform: translateY(0);
+  opacity: 1;
+  pointer-events: auto;
+  outline: none;
+}
+
+.skip-link:focus:not(:focus-visible) {
+  transform: translateY(calc(-100% - 2rem));
+  opacity: 0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .skip-link {
+    color: #f4f4f5;
+    background: #18181b;
+    box-shadow:
+      0 0 0 2px rgb(56 189 248 / 0.45),
+      0 12px 32px -8px rgb(0 0 0 / 0.6);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skip-link {
+    transition: none;
+  }
+}
