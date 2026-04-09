@@ -2,6 +2,7 @@
   "name": "bitrix-excel-charts",
   "version": "0.1.0",
   "private": true,
+  "description": "Next.js app: Bitrix24-style Excel exports parsed in the browser, predefined charts (leads, deals, contacts, companies), filters, Recharts UI, and chart export to Excel — processing stays client-side.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
