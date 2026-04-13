@@ -6,6 +6,7 @@ import {
   exportChartsToExcelFile,
   type ExcelExportTheme,
 } from "@/lib/excel/exportChartsExcel";
+import { buildExcelMainInfoLines } from "@/lib/excel/exportMainInfo";
 import { parseWorkbookFromBuffer } from "@/lib/excel/parseWorkbook";
 import {
   applyFilters,
@@ -17,26 +18,57 @@ import {
   formatCalendarMonthRu,
   formatCalendarQuarterRu,
 } from "@/lib/chart/buildChartData";
+import { seriesLegendLabel } from "@/lib/chart/seriesLegendLabel";
 import type {
   AggregationMode,
   ChartConfig,
   ChartFilter,
+  ColumnMeta,
   DateGranularity,
   TabularData,
 } from "@/lib/types";
 import {
   ENTITY_BLOCKS,
+  amountLikeColumn,
   chartsForEntity,
-  companyCreatedDateColumn,
+  companyCreatedDateColumnForKpi,
+  dealCycleClosedDateColumn,
+  dealStageOutcomeFromCell,
   normalizeConfigForTabular,
   responsibleColumn,
+  stageColumnDeals,
   suggestEntityAndCharts,
   suggestEntityFromFileName,
 } from "@/lib/predefinedCharts";
-import { formatDateYmdLocal, groupLabel, tryParseDate } from "@/lib/chart/coerce";
+import {
+  formatDateTimeDdMmYyyyRuLocal,
+  groupLabel,
+  tryParseDate,
+  tryParseNumber,
+} from "@/lib/chart/coerce";
+import {
+  formatAxisCompact,
+  formatDataDecimal,
+  formatDataInt,
+  formatDataPercent1,
+} from "@/lib/formatDataNumber";
+import { parseDealStageOrderLines } from "@/lib/chart/dealStageOrder";
+import {
+  computeDealCreationDateSeriesForKpi,
+  resolveDealKpiCreationDateColumnKey,
+} from "@/lib/report/dealRecordDates";
+import {
+  collectParsedDatesForKpiColumn,
+  formatKpiDateRu,
+  formatKpiRecordDateRu,
+  minMaxFromDateList,
+} from "@/lib/report/kpiColumnDates";
+import { calendarDaysBetweenLocalMidnight } from "@/lib/report/dealCycleDays";
+import { REPORT_INCLUDES_THROUGH_YMD } from "@/lib/report/reportThroughDate";
 import {
   chartPaletteForEntity,
   COMPANIES_RESPONSIBLE_PIE_COLORS,
+  DEALS_STAGE_SUM_PIE_COLORS,
 } from "@/lib/chart/chartPalettes";
 import {
   CHART_AXES_DARK_SURFACE,
@@ -85,6 +117,8 @@ type ChartAxesTheme = { axis: string; grid: string; tick: string };
 type PieLegendListOpts = {
   maxHeight?: number;
   maxWidth?: number | string;
+  /** Подпись числа в строке легенды (по умолчанию formatTooltipNumber). */
+  formatSliceValue?: (n: number) => string;
 };
 
 function pieLegendListContent(
@@ -157,7 +191,8 @@ function pieLegendListContent(
                   : null;
               const value = typeof raw === "number" && Number.isFinite(raw) ? raw : 0;
               const pct = total > 0 ? (value / total) * 100 : 0;
-              return `${name} — ${formatTooltipNumber(value)} (${pct.toFixed(1)}%)`;
+              const fmt = opts?.formatSliceValue ?? formatTooltipNumber;
+              return `${name} — ${fmt(value)} (${pct.toFixed(1)}%)`;
             })()}
           </span>
         </li>
@@ -169,22 +204,23 @@ function pieLegendListContent(
 function chartAxesTheme(entity: EntityBlockId | undefined): ChartAxesTheme {
   switch (entity) {
     case "deals":
+    case "companies":
       return {
         axis: "#64748b",
-        grid: "rgba(168, 85, 247, 0.2)",
-        tick: "#5b21b6",
+        grid: "rgba(0, 112, 192, 0.2)",
+        tick: "#0070C0",
+      };
+    case "generic":
+      return {
+        axis: "#64748b",
+        grid: "rgba(100, 116, 139, 0.2)",
+        tick: "#334155",
       };
     case "contacts":
       return {
         axis: "#64748b",
         grid: "rgba(16, 185, 129, 0.19)",
         tick: "#065f46",
-      };
-    case "companies":
-      return {
-        axis: "#64748b",
-        grid: "rgba(79, 70, 229, 0.2)",
-        tick: "#4338ca",
       };
     case "quotes":
       return {
@@ -203,15 +239,15 @@ function chartAxesTheme(entity: EntityBlockId | undefined): ChartAxesTheme {
 
 function tooltipChrome(entity: EntityBlockId | undefined): CSSProperties {
   const accent =
-    entity === "deals"
-      ? "139, 92, 246"
-      : entity === "contacts"
-        ? "20, 184, 166"
-        : entity === "companies"
-          ? "99, 102, 241"
-          : entity === "quotes"
-            ? "225, 29, 72"
-            : "14, 165, 233";
+    entity === "deals" || entity === "companies"
+      ? "0, 112, 192"
+      : entity === "generic"
+        ? "100, 116, 139"
+        : entity === "contacts"
+          ? "20, 184, 166"
+            : entity === "quotes"
+              ? "225, 29, 72"
+              : "14, 165, 233";
   return {
     borderRadius: "12px",
     fontSize: "13px",
@@ -228,12 +264,9 @@ function formatTooltipNumber(v: number): string {
     return String(v);
   }
   if (Math.abs(v - Math.round(v)) < 1e-9) {
-    return Math.round(v).toLocaleString("ru-RU");
+    return formatDataInt(Math.round(v));
   }
-  return v.toLocaleString("ru-RU", {
-    maximumFractionDigits: 2,
-    minimumFractionDigits: 0,
-  });
+  return formatDataDecimal(v, 2, 0);
 }
 
 /** Подпись метрики в легенде и тултипе: заголовок колонки из выгрузки + режим агрегации. */
@@ -242,58 +275,41 @@ function metricLegendLabel(
   columnKey: string,
   aggregation: AggregationMode,
   periodLabel: string,
-  cumulative?: boolean,
+  cumulative: boolean | undefined,
+  entity: EntityBlockId,
 ): string {
   const header =
     tabular.columns.find((c) => c.key === columnKey)?.header?.trim() ||
     columnKey;
-  const headerLower = header.toLowerCase();
-  let aggLabel = "сумма";
   if (cumulative) {
-    aggLabel = "накопительно";
-  } else {
-    switch (aggregation) {
-      case "count":
-        aggLabel = "количество записей";
-        break;
-      case "count_nonempty":
-        if (headerLower.includes("id") || headerLower.includes("ид")) {
-          return `Кол-во компаний · количество компаний · ${periodLabel}`;
-        }
-        aggLabel = "количество непустых значений";
-        break;
-      case "avg":
-        aggLabel = "среднее значение";
-        break;
-      case "sum":
-      default:
-        aggLabel = "сумма";
-        break;
-    }
+    return `${header} · накопительно · ${periodLabel}`;
   }
-  return `${header} · ${aggLabel} · ${periodLabel}`;
+  return `${seriesLegendLabel(header, aggregation, entity)} · ${periodLabel}`;
 }
 
 /** Tailwind: полные строки классов для корректного JIT */
 const ENTITY_CARD_BORDER: Record<EntityBlockId, string> = {
   leads: "border-l-4 border-l-sky-500",
-  deals: "border-l-4 border-l-violet-500",
+  deals: "border-l-4 border-l-indigo-500",
   contacts: "border-l-4 border-l-teal-500",
   companies: "border-l-4 border-l-indigo-500",
   quotes: "border-l-4 border-l-rose-500",
+  generic: "border-l-4 border-l-slate-500",
 };
 
 const ENTITY_SECTION_BADGE: Record<EntityBlockId, string> = {
   leads:
     "bg-sky-100 text-sky-800 dark:bg-sky-950/80 dark:text-sky-200 dark:ring-sky-800/60",
   deals:
-    "bg-violet-100 text-violet-800 dark:bg-violet-950/80 dark:text-violet-200 dark:ring-violet-800/60",
+    "bg-indigo-100 text-indigo-900 dark:bg-indigo-950/80 dark:text-indigo-200 dark:ring-indigo-800/60",
   contacts:
     "bg-teal-100 text-teal-800 dark:bg-teal-950/80 dark:text-teal-200 dark:ring-teal-800/60",
   companies:
     "bg-indigo-100 text-indigo-900 dark:bg-indigo-950/80 dark:text-indigo-200 dark:ring-indigo-800/60",
   quotes:
     "bg-rose-100 text-rose-900 dark:bg-rose-950/80 dark:text-rose-100 dark:ring-rose-800/60",
+  generic:
+    "bg-slate-100 text-slate-800 dark:bg-zinc-800/90 dark:text-slate-100 dark:ring-zinc-600/55",
 };
 
 /** Выбранный график в списке — акцент цветом раздела CRM */
@@ -301,13 +317,15 @@ const ENTITY_CHART_ROW_SELECTED: Record<EntityBlockId, string> = {
   leads:
     "border-sky-300/90 bg-gradient-to-br from-sky-50 to-white shadow-md shadow-sky-600/10 ring-2 ring-sky-400/30 dark:border-sky-600 dark:from-sky-950/50 dark:to-zinc-900 dark:ring-sky-500/25",
   deals:
-    "border-violet-300/90 bg-gradient-to-br from-violet-50 to-white shadow-md shadow-violet-600/10 ring-2 ring-violet-400/30 dark:border-violet-600 dark:from-violet-950/50 dark:to-zinc-900 dark:ring-violet-500/25",
+    "border-indigo-300/90 bg-gradient-to-br from-indigo-50 to-violet-50/50 shadow-md shadow-indigo-600/12 ring-2 ring-indigo-400/30 dark:border-indigo-600 dark:from-indigo-950/50 dark:to-zinc-900 dark:ring-indigo-500/25",
   contacts:
     "border-teal-300/90 bg-gradient-to-br from-teal-50 to-white shadow-md shadow-teal-600/10 ring-2 ring-teal-400/30 dark:border-teal-600 dark:from-teal-950/50 dark:to-zinc-900 dark:ring-teal-500/25",
   companies:
     "border-indigo-300/90 bg-gradient-to-br from-indigo-50 to-violet-50/50 shadow-md shadow-indigo-600/12 ring-2 ring-indigo-400/30 dark:border-indigo-600 dark:from-indigo-950/50 dark:to-zinc-900 dark:ring-indigo-500/25",
   quotes:
     "border-rose-300/90 bg-gradient-to-br from-rose-50 to-white shadow-md shadow-rose-600/10 ring-2 ring-rose-400/30 dark:border-rose-600 dark:from-rose-950/45 dark:to-zinc-900 dark:ring-rose-500/25",
+  generic:
+    "border-slate-300/90 bg-gradient-to-br from-slate-50 to-white shadow-md shadow-slate-600/10 ring-2 ring-slate-400/30 dark:border-slate-600 dark:from-zinc-900/80 dark:to-zinc-950 dark:ring-slate-500/25",
 };
 
 /** Карточка одного графика — градиент и бэйдж под раздел CRM */
@@ -331,12 +349,12 @@ const ENTITY_CHART_CARD: Record<
     letter: "Л",
   },
   deals: {
-    wrap: "rounded-2xl border border-violet-300/70 bg-gradient-to-br from-violet-100/65 via-fuchsia-50/30 to-white p-5 shadow-lg shadow-violet-500/12 ring-1 ring-violet-200/55 dark:border-violet-700/55 dark:from-violet-950/35 dark:via-zinc-900/88 dark:to-zinc-950 dark:ring-fuchsia-500/20",
-    head: "mb-4 flex items-center gap-3 border-b border-violet-100/85 pb-3 dark:border-violet-800/32",
+    wrap: "rounded-2xl border border-indigo-300/65 bg-gradient-to-br from-indigo-100/55 via-violet-50/38 to-cyan-50/22 p-5 shadow-lg shadow-indigo-500/12 ring-1 ring-indigo-200/55 dark:border-indigo-800/55 dark:from-indigo-950/32 dark:via-zinc-900/85 dark:to-zinc-950 dark:ring-indigo-500/20",
+    head: "mb-4 flex items-center gap-3 border-b border-indigo-200/70 pb-3 dark:border-indigo-800/45",
     title:
-      "text-sm font-semibold tracking-tight text-violet-950 dark:text-violet-50",
+      "text-sm font-semibold tracking-tight text-indigo-950 dark:text-indigo-50",
     badge:
-      "flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-fuchsia-500 via-violet-600 to-indigo-700 text-xs font-bold text-white shadow-lg shadow-fuchsia-500/28 ring-1 ring-white/25",
+      "flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 via-violet-600 to-cyan-500 text-xs font-bold text-white shadow-lg shadow-indigo-500/28 ring-1 ring-white/25",
     letter: "С",
   },
   contacts: {
@@ -366,6 +384,15 @@ const ENTITY_CHART_CARD: Record<
       "flex h-9 min-w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-rose-500 via-pink-500 to-fuchsia-600 px-1.5 text-[10px] font-bold leading-none text-white shadow-lg shadow-rose-500/30 ring-1 ring-white/25",
     letter: "КП",
   },
+  generic: {
+    wrap: "rounded-2xl border border-slate-300/65 bg-gradient-to-br from-slate-100/55 via-zinc-50/35 to-white p-5 shadow-lg shadow-slate-500/10 ring-1 ring-slate-200/55 dark:border-zinc-700/65 dark:from-zinc-900/55 dark:via-zinc-900/88 dark:to-zinc-950 dark:ring-zinc-600/22",
+    head: "mb-4 flex items-center gap-3 border-b border-slate-200/80 pb-3 dark:border-zinc-700/45",
+    title:
+      "text-sm font-semibold tracking-tight text-slate-900 dark:text-slate-50",
+    badge:
+      "flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-slate-500 via-slate-600 to-zinc-700 text-xs font-bold text-white shadow-lg shadow-slate-500/25 ring-1 ring-white/20",
+    letter: "∑",
+  },
 };
 
 const ENTITY_CHART_ERR: Record<EntityBlockId, string> = {
@@ -379,6 +406,8 @@ const ENTITY_CHART_ERR: Record<EntityBlockId, string> = {
     "rounded-2xl border border-indigo-300/75 bg-gradient-to-br from-indigo-50/95 to-violet-50/45 p-4 shadow-sm ring-1 ring-indigo-200/50 dark:border-indigo-800/65 dark:from-indigo-950/48 dark:to-zinc-900/92 dark:ring-indigo-900/28",
   quotes:
     "rounded-2xl border border-amber-200/90 bg-gradient-to-br from-amber-50/95 to-rose-50/30 p-4 shadow-sm ring-1 ring-amber-100/45 dark:border-amber-900/55 dark:from-amber-950/42 dark:to-zinc-900/92 dark:ring-rose-900/22",
+  generic:
+    "rounded-2xl border border-slate-300/80 bg-gradient-to-br from-slate-50/95 to-zinc-50/40 p-4 shadow-sm ring-1 ring-slate-200/50 dark:border-zinc-700/65 dark:from-zinc-900/55 dark:to-zinc-950/92 dark:ring-zinc-700/30",
 };
 
 const ENTITY_PICKER_SELECTED: Record<EntityBlockId, string> = {
@@ -392,6 +421,8 @@ const ENTITY_PICKER_SELECTED: Record<EntityBlockId, string> = {
     "border-indigo-400 bg-gradient-to-br from-indigo-50 via-white to-violet-50/20 shadow-lg shadow-indigo-500/18 ring-2 ring-indigo-400/45 dark:border-indigo-500 dark:from-indigo-950/42 dark:via-zinc-900 dark:to-indigo-950/22 dark:ring-indigo-500/40",
   quotes:
     "border-rose-400 bg-gradient-to-br from-rose-50 via-white to-pink-50/25 shadow-lg shadow-rose-500/18 ring-2 ring-rose-400/45 dark:border-rose-500 dark:from-rose-950/42 dark:via-zinc-900 dark:to-rose-950/22 dark:ring-rose-500/40",
+  generic:
+    "border-slate-400 bg-gradient-to-br from-slate-50 via-white to-zinc-50/30 shadow-lg shadow-slate-500/15 ring-2 ring-slate-400/40 dark:border-slate-500 dark:from-zinc-900/55 dark:via-zinc-900 dark:to-zinc-950/90 dark:ring-slate-500/38",
 };
 
 const ENTITY_PICKER_IDLE =
@@ -407,10 +438,14 @@ const ENTITY_CHECKBOX_ACCENT: Record<EntityBlockId, string> = {
   companies:
     "accent-indigo-600 focus-visible:ring-indigo-500/55 dark:accent-indigo-500",
   quotes: "accent-rose-600 focus-visible:ring-rose-500/55 dark:accent-rose-500",
+  generic:
+    "accent-slate-600 focus-visible:ring-slate-500/55 dark:accent-slate-500",
 };
 
 const SECTION_LABEL =
   "text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400";
+
+const DEAL_STAGE_ORDER_STORAGE_KEY = "b24-deal-stage-order-lines";
 
 const INPUT_FIELD =
   "w-full rounded-2xl border-0 bg-white/95 px-3.5 py-2.5 text-sm text-zinc-900 shadow-[0_1px_2px_rgb(0_0_0/0.04)] ring-1 ring-zinc-200/85 transition-[box-shadow,ring-color] placeholder:text-zinc-400 hover:ring-zinc-300/80 focus:outline-none focus:ring-2 focus:ring-sky-500/45 dark:bg-zinc-900/90 dark:text-zinc-100 dark:ring-zinc-600/85 dark:placeholder:text-zinc-500 dark:hover:ring-zinc-500/70 dark:focus:ring-sky-400/45";
@@ -470,7 +505,7 @@ function ExportDock({
             {chartCount > 0 ? (
               <>
                 {chartCountLabel(chartCount)} ·{" "}
-                {filteredRowCount.toLocaleString("ru-RU")} строк после фильтров
+                {formatDataInt(filteredRowCount)} строк после фильтров
               </>
             ) : (
               "Отметьте графики в боковой панели — затем нажмите кнопку справа"
@@ -590,11 +625,6 @@ function monthKeyForCompanyTrend(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
-/**
- * Средний помесячный % прироста числа записей с датой создания:
- * по каждой паре соседних календарных месяцев от минимального к максимальному;
- * месяцы без записей считаются как 0.
- */
 /** Сколько разных непустых значений в колонке «Ответственный» (после фильтров). */
 function countDistinctResponsible(
   rows: Record<string, unknown>[],
@@ -616,9 +646,23 @@ function countDistinctResponsible(
   return distinct.size;
 }
 
-function averageMonthOverMonthGrowthPercent(dates: Date[]): number | null {
+/**
+ * «Темп роста»: среднее арифметическое помесячных темпов роста числа записей.
+ * Для каждого календарного месяца в диапазоне от минимальной до максимальной даты
+ * считается число строк с датой в этом месяце; для пары соседних месяцев (M−1 → M):
+ * темп роста % = 100 × (число в M) / max(число в M−1, 1).
+ * Делитель не меньше 1, чтобы не делить на ноль.
+ * Итог — среднее по всем таким парам (от первого до последнего месяца диапазона).
+ */
+function averageMonthOverMonthGrowthPercent(dates: Date[]): {
+  percent: number | null;
+  /** Сколько календарных месяцев подряд взято от самой ранней до самой поздней даты */
+  monthsInTimeline: number;
+  /** Сколько помесячных сравнений (на одно меньше, чем месяцев в шкале) */
+  comparisons: number;
+} {
   if (dates.length === 0) {
-    return null;
+    return { percent: null, monthsInTimeline: 0, comparisons: 0 };
   }
   const byMonth = new Map<string, number>();
   for (const d of dates) {
@@ -653,24 +697,291 @@ function averageMonthOverMonthGrowthPercent(dates: Date[]): number | null {
     }
   }
   if (counts.length < 2) {
-    return null;
+    return {
+      percent: null,
+      monthsInTimeline: counts.length,
+      comparisons: 0,
+    };
   }
   const pcts: number[] = [];
   for (let i = 1; i < counts.length; i++) {
     const prev = counts[i - 1]!;
     const cur = counts[i]!;
-    pcts.push((100 * (cur - prev)) / Math.max(prev, 1));
+    pcts.push((100 * cur) / Math.max(prev, 1));
   }
-  return pcts.reduce((a, b) => a + b, 0) / pcts.length;
+  return {
+    percent: pcts.reduce((a, b) => a + b, 0) / pcts.length,
+    monthsInTimeline: counts.length,
+    comparisons: pcts.length,
+  };
+}
+
+type SidebarSummaryKpi = {
+  total: number;
+  activeResponsiblesCount: number | null;
+  hasResponsibleColumn: boolean;
+  avgPerMonth: number | null;
+  /** Детали расчёта «Среднее в месяц»: строки ÷ число календарных месяцев в диапазоне min–max дат. */
+  avgPerMonthMeta: {
+    monthSpan: number;
+    minDateLabel: string;
+    maxDateLabel: string;
+  } | null;
+  hasDateColumn: boolean;
+  /** Подпись колонки даты для подсказок в UI */
+  dateColumnHeader: string | null;
+  firstRecordDate: string | null;
+  lastRecordDate: string | null;
+  growthRateAvgPercent: number | null;
+  /** Детали расчёта «Темп роста»: среднее из помесячных % роста */
+  growthRateMeta: {
+    comparisons: number;
+    monthsInTimeline: number;
+    minDateLabel: string;
+    maxDateLabel: string;
+    hasPercent: boolean;
+  } | null;
+};
+
+/**
+ * Сводка по датам: `dateKey` из `companyCreatedDateColumnForKpi` или заранее из
+ * {@link computeDealCreationDateSeriesForKpi} для сделок.
+ * `precomputedDates` — чтобы не собирать даты сделки дважды.
+ */
+function buildSidebarSummaryKpi(
+  tabular: TabularData,
+  filteredRows: Record<string, unknown>[],
+  dateKey: string | null,
+  precomputedDates?: Date[],
+): SidebarSummaryKpi {
+  const total = filteredRows.length;
+  const respMeta = responsibleColumn(tabular.columns);
+  const responsibleKey = respMeta?.key ?? null;
+  const activeResponsiblesCount = countDistinctResponsible(filteredRows, responsibleKey);
+  const hasResponsibleColumn = !!respMeta;
+  const dateMeta = dateKey ? tabular.columns.find((c) => c.key === dateKey) : null;
+  const dateColumnHeader = dateMeta?.header?.trim() ?? null;
+  const emptyDates = {
+    firstRecordDate: null as string | null,
+    lastRecordDate: null as string | null,
+    growthRateAvgPercent: null as number | null,
+    growthRateMeta: null as SidebarSummaryKpi["growthRateMeta"],
+  };
+  const kpiBase = {
+    total,
+    activeResponsiblesCount,
+    hasResponsibleColumn,
+    dateColumnHeader,
+  };
+  if (!dateKey || total === 0) {
+    return {
+      ...kpiBase,
+      avgPerMonth: null,
+      avgPerMonthMeta: null,
+      hasDateColumn: !!dateKey,
+      ...emptyDates,
+    };
+  }
+  const dates =
+    precomputedDates !== undefined
+      ? precomputedDates
+      : collectParsedDatesForKpiColumn(filteredRows, dateKey, dateMeta);
+  if (dates.length === 0) {
+    return {
+      ...kpiBase,
+      avgPerMonth: null,
+      avgPerMonthMeta: null,
+      hasDateColumn: true,
+      ...emptyDates,
+    };
+  }
+  const mm = minMaxFromDateList(dates)!;
+  const minD = mm.min;
+  const maxD = mm.max;
+  const monthSpan =
+    (maxD.getFullYear() - minD.getFullYear()) * 12 +
+    (maxD.getMonth() - minD.getMonth()) +
+    1;
+  const avgPerMonth = total / Math.max(1, monthSpan);
+  const growth = averageMonthOverMonthGrowthPercent(dates);
+  const growthRateAvgPercent = growth.percent;
+  const growthRateMeta: SidebarSummaryKpi["growthRateMeta"] = {
+    comparisons: growth.comparisons,
+    monthsInTimeline: growth.monthsInTimeline,
+    minDateLabel: formatKpiDateRu(minD),
+    maxDateLabel: formatKpiDateRu(maxD),
+    hasPercent: growth.percent != null,
+  };
+
+  return {
+    ...kpiBase,
+    avgPerMonth,
+    avgPerMonthMeta: {
+      monthSpan,
+      minDateLabel: formatKpiDateRu(minD),
+      maxDateLabel: formatKpiDateRu(maxD),
+    },
+    hasDateColumn: true,
+    /** Самая ранняя и самая поздняя дата в колонке среди строк после фильтров (одинаково для компаний и сделок). */
+    firstRecordDate: formatKpiRecordDateRu(minD),
+    lastRecordDate: formatKpiRecordDateRu(maxD),
+    growthRateAvgPercent,
+    growthRateMeta,
+  };
+}
+
+function dealRowAmount(
+  row: Record<string, unknown>,
+  amountKey: string | null,
+): number {
+  if (!amountKey) {
+    return 0;
+  }
+  const n = tryParseNumber(row[amountKey]);
+  return n !== null && Number.isFinite(n) ? n : 0;
+}
+
+/** Целые суммы в рублях: разряды через пробел (ru-RU), без дублирования запятых как в formatDataInt. */
+function formatMoneyKpi(n: number): string {
+  return new Intl.NumberFormat("ru-RU", {
+    maximumFractionDigits: 0,
+    minimumFractionDigits: 0,
+    useGrouping: true,
+  }).format(n);
+}
+
+function formatMoneyRubPie(n: number): string {
+  return `${formatMoneyKpi(n)}\u00a0₽`;
+}
+
+/** Средние суммы (руб.) с одной цифрой после запятой при необходимости. */
+function formatMoneyAvgKpi(n: number): string {
+  return `${new Intl.NumberFormat("ru-RU", {
+    maximumFractionDigits: 1,
+    minimumFractionDigits: 0,
+    useGrouping: true,
+  }).format(n)}\u00a0₽`;
+}
+
+function aggregationIsMoney(agg: AggregationMode | undefined): boolean {
+  return agg === "sum" || agg === "avg";
+}
+
+/** Компактная ось Y: число + ₽ для сумм и средних. */
+function formatAxisCompactRub(v: number): string {
+  return `${formatAxisCompact(v)}\u00a0₽`;
+}
+
+/**
+ * Значение в тултипе графика по режиму агрегации (как в Excel: sum/avg — рубли).
+ */
+function formatChartTooltipValue(
+  v: number,
+  agg: AggregationMode | undefined,
+  chartId: string | undefined,
+  chartKind: "bar" | "line" | "area" | "pie",
+): string {
+  const a = agg ?? "sum";
+  if (
+    chartId === "deals_won_sum_and_count_by_responsible" &&
+    chartKind === "bar"
+  ) {
+    if (a === "sum") return formatMoneyRubPie(v);
+    if (a === "count") return `${formatTooltipNumber(v)} сделок`;
+    return formatTooltipNumber(v);
+  }
+  if (aggregationIsMoney(a)) {
+    return a === "avg" ? formatMoneyAvgKpi(v) : formatMoneyRubPie(v);
+  }
+  if (a === "count" || a === "count_nonempty") {
+    return `${formatTooltipNumber(v)} шт.`;
+  }
+  return formatTooltipNumber(v);
+}
+
+/** Подпись у точки на линии/area: без «шт.» на метке, но с ₽ для денег. */
+function formatChartPointLabel(
+  v: number,
+  agg: AggregationMode | undefined,
+): string {
+  const a = agg ?? "sum";
+  if (a === "sum") return formatMoneyRubPie(v);
+  if (a === "avg") return formatMoneyAvgKpi(v);
+  return formatTooltipNumber(v);
+}
+
+function formatDaysKpi(n: number): string {
+  return formatDataDecimal(n, 1, 0);
+}
+
+/** Среднее по целым дням — отображаем как целое число дней. */
+function formatDaysKpiIntegerMean(n: number): string {
+  return formatDataInt(Math.round(n));
+}
+
+/**
+ * Колонка с датами в выгрузке сделок часто имеет тип string — тогда ось времени
+ * и переключатель «Период» должны работать так же, как для типа date.
+ */
+function dealDateColumnLooksLikeTimeAxis(meta: ColumnMeta): boolean {
+  if (meta.inferredType === "date") {
+    return true;
+  }
+  if (meta.inferredType !== "string" && meta.inferredType !== "unknown") {
+    return false;
+  }
+  const h = meta.header.trim().toLowerCase();
+  if (
+    /дата|date|time|period|закрыт|создан|изменен|отправк|план|deadline|calendar/i.test(
+      h,
+    )
+  ) {
+    return true;
+  }
+  for (const v of meta.sampleValues.slice(0, 12)) {
+    if (tryParseDate(v) != null) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function rowDealDate(
+  row: Record<string, unknown>,
+  key: string | null,
+): Date | null {
+  if (!key) {
+    return null;
+  }
+  const raw = row[key];
+  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+    return raw;
+  }
+  return tryParseDate(raw);
+}
+
+const CHART_IDS_IGNORE_STAGE_GLOBAL_FILTERS = new Set<string>([
+  "deals_cumulative_count_by_month_area",
+]);
+
+function isStageLikeFilter(tabular: TabularData, f: ChartFilter): boolean {
+  const meta = tabular.columns.find((c) => c.key === f.columnKey);
+  const h = (meta?.header || f.columnKey || "").toLowerCase();
+  return /стад|stage|воронк|pipeline/.test(h);
 }
 
 function mergeGlobalFilters(
   cfg: ChartConfig,
   global: ChartFilter[],
+  tabular: TabularData,
+  chartId: string,
 ): ChartConfig {
+  const globalPrepared = CHART_IDS_IGNORE_STAGE_GLOBAL_FILTERS.has(chartId)
+    ? global.filter((f) => !isStageLikeFilter(tabular, f))
+    : global;
   return {
     ...cfg,
-    filters: [...global, ...cfg.filters],
+    filters: [...globalPrepared, ...cfg.filters],
   };
 }
 
@@ -686,28 +997,6 @@ function feasibleChartIdsForEntity(
   return chartsForEntity(entity)
     .filter((s) => s.resolve(tabular.columns).ok)
     .map((s) => s.id);
-}
-
-function autoSelectableChartIdsForEntity(
-  entity: EntityBlockId,
-  tabular: TabularData,
-): string[] {
-  const ids: string[] = [];
-  for (const spec of chartsForEntity(entity)) {
-    const resolved = spec.resolve(tabular.columns);
-    if (!resolved.ok) {
-      continue;
-    }
-    const cfg = normalizeConfigForTabular(tabular, resolved.config);
-    if (!cfg.xKey || cfg.yKeys.length === 0) {
-      continue;
-    }
-    const built = buildAggregatedChartRows(tabular.rows, cfg, tabular.columns);
-    if (built.data.length > 0) {
-      ids.push(spec.id);
-    }
-  }
-  return ids;
 }
 
 export default function ReportApp() {
@@ -728,6 +1017,29 @@ export default function ReportApp() {
   const [exportMessage, setExportMessage] = useState<string | null>(null);
   const [chartSurface, setChartSurface] = useState<ChartSurfaceId>("default");
   const [exportTheme, setExportTheme] = useState<ExcelExportTheme>("classic");
+  const [dealStageOrderText, setDealStageOrderText] = useState<string>(() => {
+    if (typeof window === "undefined") {
+      return "";
+    }
+    try {
+      return localStorage.getItem(DEAL_STAGE_ORDER_STORAGE_KEY) ?? "";
+    } catch {
+      return "";
+    }
+  });
+
+  const dealStageOrder = useMemo(
+    () => parseDealStageOrderLines(dealStageOrderText),
+    [dealStageOrderText],
+  );
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(DEAL_STAGE_ORDER_STORAGE_KEY, dealStageOrderText);
+    } catch {
+      /* ignore */
+    }
+  }, [dealStageOrderText]);
 
   useEffect(() => {
     try {
@@ -791,18 +1103,13 @@ export default function ReportApp() {
       setExportMessage(null);
       const inferredByName = suggestEntityFromFileName(name);
       const suggestion = inferredByName
-        ? {
-            entity: inferredByName,
-            chartIds: autoSelectableChartIdsForEntity(inferredByName, result.data),
-          }
+        ? { entity: inferredByName }
         : suggestEntityAndCharts(result.data.columns);
       if (suggestion) {
         setImportEntity(suggestion.entity);
-        const autoIds = autoSelectableChartIdsForEntity(
-          suggestion.entity,
-          result.data,
-        );
-        setEnabledChartIds(new Set(autoIds));
+        /** Все графики сущности, которые сопоставляются с колонками (как при ручном выборе «Сделки» / «Компании») — в т.ч. для Excel со всеми листами. */
+        const feasible = feasibleChartIdsForEntity(suggestion.entity, result.data);
+        setEnabledChartIds(new Set(feasible));
       } else {
         setImportEntity(null);
         setEnabledChartIds(new Set());
@@ -815,10 +1122,24 @@ export default function ReportApp() {
     if (!tabular || !importEntity) {
       return;
     }
+    const mergedWonManagersChartId = "deals_won_sum_and_count_by_responsible";
+    const legacyWonManagersChartIds = new Set([
+      "deals_top_managers_won_sum",
+      "deals_top_managers_won_count",
+    ]);
     const feasible = new Set(feasibleChartIdsForEntity(importEntity, tabular));
     setEnabledChartIds((prev) => {
       const next = new Set([...prev].filter((id) => feasible.has(id)));
-      if (next.size === prev.size) {
+      const hadLegacyWonManagers =
+        [...prev].some((id) => legacyWonManagersChartIds.has(id)) ||
+        [...next].some((id) => legacyWonManagersChartIds.has(id));
+      if (hadLegacyWonManagers && feasible.has(mergedWonManagersChartId)) {
+        next.add(mergedWonManagersChartId);
+      }
+      if (
+        next.size === prev.size &&
+        [...next].every((id) => prev.has(id))
+      ) {
         return prev;
       }
       return next;
@@ -875,94 +1196,181 @@ export default function ReportApp() {
     return applyFilters(tabular.rows, globalFilters);
   }, [tabular, globalFilters]);
 
-  /** Сводка для выгрузки компаний: всего строк, первая/последняя дата, среднее в месяц. */
-  const companySummaryKpi = useMemo(() => {
-    if (!tabular || importEntity !== "companies") {
+  /** Сводка для выгрузок компаний/сделок: всего строк, даты, среднее в месяц. */
+  const entitySummaryKpi = useMemo(() => {
+    if (!tabular) {
       return null;
     }
-    const total = filteredRows.length;
-    const respMeta = responsibleColumn(tabular.columns);
-    const responsibleKey = respMeta?.key ?? null;
-    const activeResponsiblesCount = countDistinctResponsible(
+    if (importEntity === "companies") {
+      const dateMeta = companyCreatedDateColumnForKpi(
+        tabular.columns,
+        filteredRows,
+      );
+      return buildSidebarSummaryKpi(tabular, filteredRows, dateMeta?.key ?? null);
+    }
+    if (importEntity === "deals") {
+      const { dateKey, dates } = computeDealCreationDateSeriesForKpi(
+        tabular.columns,
+        filteredRows,
+      );
+      return buildSidebarSummaryKpi(tabular, filteredRows, dateKey, dates);
+    }
+    return null;
+  }, [tabular, importEntity, filteredRows]);
+
+  const dealsFunnelKpi = useMemo(() => {
+    if (!tabular || importEntity !== "deals") {
+      return null;
+    }
+    const stageMeta = stageColumnDeals(tabular.columns);
+    const amountMeta = amountLikeColumn(tabular.columns);
+    const amountKey = amountMeta?.key ?? null;
+    const hasAmountColumn = !!amountKey;
+    const createdKey = resolveDealKpiCreationDateColumnKey(
+      tabular.columns,
       filteredRows,
-      responsibleKey,
     );
-    const hasResponsibleColumn = !!respMeta;
-    const dateMeta = companyCreatedDateColumn(tabular.columns);
-    const emptyDates = {
-      firstRecordDate: null as string | null,
-      lastRecordDate: null as string | null,
-      growthRateAvgPercent: null as number | null,
-    };
-    const kpiBase = {
-      total,
-      activeResponsiblesCount,
-      hasResponsibleColumn,
-    };
-    if (!dateMeta || total === 0) {
-      return {
-        ...kpiBase,
-        avgPerMonth: null as number | null,
-        hasDateColumn: !!dateMeta,
-        ...emptyDates,
-      };
-    }
-    const dateKey = dateMeta.key;
-    const dates: Date[] = [];
+    const closedKey = dealCycleClosedDateColumn(tabular.columns)?.key ?? null;
+    const hasCreatedDateColumn = !!createdKey;
+    const hasClosedDateColumn = !!closedKey;
+    /** Иначе обе даты читаются из одной ячейки — разница всегда 0, среднее бессмысленно. */
+    const cycleUsesDistinctDateColumns =
+      !!createdKey && !!closedKey && createdKey !== closedKey;
+    const total = filteredRows.length;
+
+    let potentialIncome = 0;
+    let won = 0;
+    let lost = 0;
+    let incomeInProgress = 0;
+    let incomeWon = 0;
+    let incomeLost = 0;
+    let sumDaysToClose = 0;
+    let nClosePairs = 0;
+
     for (const row of filteredRows) {
-      const raw = row[dateKey];
-      let d: Date | null = null;
-      if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
-        d = raw;
-      } else {
-        d = tryParseDate(raw);
+      const amt = dealRowAmount(row, amountKey);
+      if (hasAmountColumn) {
+        potentialIncome += amt;
       }
-      if (d && !Number.isNaN(d.getTime())) {
-        dates.push(d);
+      if (!stageMeta) {
+        continue;
+      }
+      const o = dealStageOutcomeFromCell(row[stageMeta.key]);
+      if (o === "won") {
+        won++;
+        incomeWon += amt;
+      } else if (o === "lost") {
+        lost++;
+        incomeLost += amt;
+      } else {
+        incomeInProgress += amt;
+      }
+
+      if (
+        cycleUsesDistinctDateColumns &&
+        (o === "won" || o === "lost")
+      ) {
+        const d0 = rowDealDate(row, createdKey);
+        const d1 = rowDealDate(row, closedKey);
+        if (d0 && d1) {
+          const days = calendarDaysBetweenLocalMidnight(d0, d1);
+          if (days >= 0) {
+            sumDaysToClose += days;
+            nClosePairs++;
+          }
+        }
       }
     }
-    if (dates.length === 0) {
+
+    const inProgress = stageMeta ? total - won - lost : 0;
+    const closed = won + lost;
+    const conversionClosedPercent =
+      stageMeta && closed > 0 ? (100 * won) / closed : null;
+    const closedMoney = incomeWon + incomeLost;
+    const conversionMoneyPercent =
+      stageMeta && hasAmountColumn && closedMoney > 0
+        ? (100 * incomeWon) / closedMoney
+        : null;
+
+    const avgCheckAll =
+      hasAmountColumn && total > 0 ? potentialIncome / total : null;
+    const avgCheckWon =
+      stageMeta && hasAmountColumn && won > 0 ? incomeWon / won : null;
+    /**
+     * «Средний цикл в работе»: только сделки won/lost; для каждой строки
+     * calendarDaysBetweenLocalMidnight(создание, закрытие) ≥ 0; среднее по строкам
+     * с обеими датами. Закрытых без пары дат больше, чем nClosePairs — не попали в среднее.
+     */
+    const avgDaysInWork =
+      stageMeta &&
+      cycleUsesDistinctDateColumns &&
+      nClosePairs > 0
+        ? sumDaysToClose / nClosePairs
+        : null;
+
+    if (!stageMeta) {
       return {
-        ...kpiBase,
-        avgPerMonth: null as number | null,
-        hasDateColumn: true,
-        ...emptyDates,
+        hasStageColumn: false as const,
+        hasAmountColumn,
+        hasCreatedDateColumn,
+        hasClosedDateColumn,
+        total,
+        inProgress: 0,
+        won: 0,
+        lost: 0,
+        conversionClosedPercent: null as number | null,
+        potentialIncome: hasAmountColumn ? potentialIncome : null,
+        incomeInProgress: null as number | null,
+        incomeWon: null as number | null,
+        incomeLost: null as number | null,
+        conversionMoneyPercent: null as number | null,
+        avgCheckAll,
+        avgCheckWon: null as number | null,
+        avgDaysInWork: null as number | null,
+        avgDaysInWorkSampleSize: 0,
+        cycleUsesDistinctDateColumns: false,
       };
     }
-    let minT = dates[0]!.getTime();
-    let maxT = dates[0]!.getTime();
-    for (const d of dates) {
-      const t = d.getTime();
-      if (t < minT) {
-        minT = t;
-      }
-      if (t > maxT) {
-        maxT = t;
-      }
-    }
-    const minD = new Date(minT);
-    const maxD = new Date(maxT);
-    const monthSpan =
-      (maxD.getFullYear() - minD.getFullYear()) * 12 +
-      (maxD.getMonth() - minD.getMonth()) +
-      1;
-    const avgPerMonth = total / Math.max(1, monthSpan);
-    const dateFmt = (dt: Date) =>
-      dt.toLocaleDateString("ru-RU", {
-        day: "2-digit",
-        month: "2-digit",
-        year: "numeric",
-      });
-    const growthRateAvgPercent = averageMonthOverMonthGrowthPercent(dates);
+
     return {
-      ...kpiBase,
-      avgPerMonth,
-      hasDateColumn: true,
-      firstRecordDate: dateFmt(minD),
-      lastRecordDate: dateFmt(maxD),
-      growthRateAvgPercent,
+      hasStageColumn: true as const,
+      hasAmountColumn,
+      hasCreatedDateColumn,
+      hasClosedDateColumn,
+      cycleUsesDistinctDateColumns,
+      total,
+      inProgress,
+      won,
+      lost,
+      conversionClosedPercent,
+      potentialIncome: hasAmountColumn ? potentialIncome : null,
+      incomeInProgress: hasAmountColumn ? incomeInProgress : null,
+      incomeWon: hasAmountColumn ? incomeWon : null,
+      incomeLost: hasAmountColumn ? incomeLost : null,
+      conversionMoneyPercent,
+      avgCheckAll,
+      avgCheckWon,
+      avgDaysInWork,
+      avgDaysInWorkSampleSize: nClosePairs,
     };
   }, [tabular, importEntity, filteredRows]);
+
+  const excelMainInfoLines = useMemo(() => {
+    if (!tabular || !importEntity) {
+      return [];
+    }
+    const entityLabel =
+      ENTITY_BLOCKS.find((b) => b.id === importEntity)?.label ?? importEntity;
+    return buildExcelMainInfoLines({
+      entityLabel,
+      importEntity,
+      kpi:
+        importEntity === "companies" || importEntity === "deals"
+          ? entitySummaryKpi
+          : null,
+      dealsFunnel: importEntity === "deals" ? dealsFunnelKpi : null,
+    });
+  }, [tabular, importEntity, entitySummaryKpi, dealsFunnelKpi]);
 
   const onExportChartsExcel = useCallback(async () => {
     if (!tabular) {
@@ -978,14 +1386,26 @@ export default function ReportApp() {
         fileNameBase: base,
         sourceFileName: fileName ?? undefined,
         theme: exportTheme,
+        dealStageOrder: dealStageOrder.length > 0 ? dealStageOrder : null,
+        mainInfo: excelMainInfoLines,
       },
     );
     setExportMessage(
       res.ok
-        ? `Файл сохранён: ${res.fileName} (${res.sheetsWritten} лист.)`
+        ? res.warning
+          ? `Файл сохранён: ${res.fileName} (${res.sheetsWritten} лист.) ${res.warning}`
+          : `Файл сохранён: ${res.fileName} (${res.sheetsWritten} лист.)`
         : res.error,
     );
-  }, [tabular, fileName, enabledChartIds, globalFilters, exportTheme]);
+  }, [
+    tabular,
+    fileName,
+    enabledChartIds,
+    globalFilters,
+    exportTheme,
+    dealStageOrder,
+    excelMainInfoLines,
+  ]);
 
   const exportEnabled =
     tabular != null &&
@@ -1170,8 +1590,9 @@ export default function ReportApp() {
               Выбрать файл .xlsx / .xls
             </span>
             <span className="max-w-md text-xs leading-relaxed text-zinc-500 dark:text-zinc-500">
-              До {(MAX_FILE_BYTES / 1024 / 1024).toFixed(0)} МБ · колонки
-              сопоставляются с типичными заголовками Битрикс24
+              До {(MAX_FILE_BYTES / 1024 / 1024).toFixed(0)} МБ · графики
+              подбираются по колонкам; нет типичной CRM-выгрузки — режим
+              «Универсально»
             </span>
           </div>
         </section>
@@ -1218,18 +1639,22 @@ export default function ReportApp() {
                     {fileName}
                   </p>
                 </div>
-                {companySummaryKpi && (
+                {entitySummaryKpi && (
                   <div
                     className="grid gap-2 rounded-xl border border-indigo-200/80 bg-indigo-50/75 px-3.5 py-3 text-sm dark:border-indigo-800/50 dark:bg-indigo-950/35"
                     role="region"
-                    aria-label="Сводка по компаниям"
+                    aria-label={
+                      importEntity === "deals"
+                        ? "Сводка по сделкам"
+                        : "Сводка по компаниям"
+                    }
                   >
                     <div className="flex items-baseline justify-between gap-4">
                       <span className="text-zinc-600 dark:text-zinc-400">
-                        Всего компаний
+                        {importEntity === "deals" ? "Всего сделок" : "Всего компаний"}
                       </span>
                       <span className="tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
-                        {companySummaryKpi.total.toLocaleString("ru-RU")}
+                        {formatDataInt(entitySummaryKpi.total)}
                       </span>
                     </div>
                     <div className="flex items-baseline justify-between gap-4 border-t border-indigo-200/70 pt-2 dark:border-indigo-800/45">
@@ -1240,89 +1665,424 @@ export default function ReportApp() {
                         Активных ответственных
                       </span>
                       <span className="tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
-                        {companySummaryKpi.activeResponsiblesCount != null
-                          ? companySummaryKpi.activeResponsiblesCount.toLocaleString(
-                              "ru-RU",
-                            )
+                        {entitySummaryKpi.activeResponsiblesCount != null
+                          ? formatDataInt(entitySummaryKpi.activeResponsiblesCount)
                           : "—"}
                       </span>
                     </div>
                     <div className="flex items-baseline justify-between gap-4">
                       <span
                         className="text-zinc-600 dark:text-zinc-400"
-                        title="Минимальная дата в колонке создания по строкам после фильтров (при неоднозначных датах — среди успешно разобранных значений)."
+                        title={
+                          entitySummaryKpi.dateColumnHeader
+                            ? `Самая ранняя дата в колонке «${entitySummaryKpi.dateColumnHeader}» среди строк после фильтров.`
+                            : "Самая ранняя дата в колонке после фильтров."
+                        }
                       >
                         Дата первой записи
                       </span>
                       <span className="shrink-0 text-right text-sm font-semibold tabular-nums text-zinc-900 dark:text-zinc-50">
-                        {companySummaryKpi.firstRecordDate ?? "—"}
+                        {entitySummaryKpi.firstRecordDate ?? "—"}
                       </span>
                     </div>
                     <div className="flex items-baseline justify-between gap-4">
                       <span
                         className="text-zinc-600 dark:text-zinc-400"
-                        title="Максимальная дата в колонке создания по строкам после фильтров."
+                        title={
+                          entitySummaryKpi.dateColumnHeader
+                            ? `Самая поздняя дата в колонке «${entitySummaryKpi.dateColumnHeader}» среди строк после фильтров.`
+                            : "Самая поздняя дата в колонке после фильтров."
+                        }
                       >
                         Дата последней записи
                       </span>
                       <span className="shrink-0 text-right text-sm font-semibold tabular-nums text-zinc-900 dark:text-zinc-50">
-                        {companySummaryKpi.lastRecordDate ?? "—"}
+                        {entitySummaryKpi.lastRecordDate ?? "—"}
                       </span>
                     </div>
-                    <div className="flex items-baseline justify-between gap-4 border-t border-indigo-200/70 pt-2 dark:border-indigo-800/45">
-                      <span
-                        className="text-zinc-600 dark:text-zinc-400"
-                        title="Строк после фильтров, делённое на число календарных месяцев от минимальной до максимальной даты в колонке даты создания (как в выгрузке Битрикс24)."
-                      >
-                        Среднее в месяц
-                      </span>
-                      <span className="tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
-                        {companySummaryKpi.avgPerMonth != null
-                          ? companySummaryKpi.avgPerMonth.toLocaleString(
-                              "ru-RU",
-                              {
-                                maximumFractionDigits: 1,
-                                minimumFractionDigits: 0,
-                              },
-                            )
+                    <div className="flex items-start justify-between gap-4 border-t border-indigo-200/70 pt-2 dark:border-indigo-800/45">
+                      <div className="min-w-0 flex-1">
+                        <span
+                          className="text-zinc-600 dark:text-zinc-400"
+                          title={
+                            entitySummaryKpi.avgPerMonthMeta &&
+                            entitySummaryKpi.dateColumnHeader
+                              ? `Считается так: (число строк после фильтров) ÷ (число календарных месяцев от самой ранней до самой поздней даты в колонке «${entitySummaryKpi.dateColumnHeader}» среди всех строк). Сейчас: ${formatDataInt(entitySummaryKpi.total)} ÷ ${entitySummaryKpi.avgPerMonthMeta.monthSpan} = среднее за месяц. Месяцы считаются включительно: от ${entitySummaryKpi.avgPerMonthMeta.minDateLabel} до ${entitySummaryKpi.avgPerMonthMeta.maxDateLabel} это ${entitySummaryKpi.avgPerMonthMeta.monthSpan} календарный месяц(ев). Это не среднее «по факту строк в каждом месяце», а ровное распределение всего объёма на ширину диапазона дат.`
+                              : entitySummaryKpi.dateColumnHeader
+                                ? `Считается так: (число строк после фильтров) ÷ (число календарных месяцев между минимальной и максимальной датой в колонке «${entitySummaryKpi.dateColumnHeader}»).`
+                                : "Число строк после фильтров, делённое на число календарных месяцев между минимальной и максимальной датой в выбранной колонке даты."
+                          }
+                        >
+                          Среднее в месяц
+                        </span>
+                        {entitySummaryKpi.avgPerMonth != null &&
+                          entitySummaryKpi.avgPerMonthMeta && (
+                            <p className="mt-1 text-[11px] leading-snug text-zinc-500 dark:text-zinc-400">
+                              {formatDataInt(entitySummaryKpi.total)} ÷{" "}
+                              {entitySummaryKpi.avgPerMonthMeta.monthSpan}{" "}
+                              мес. (диапазон дат в колонке:{" "}
+                              {entitySummaryKpi.avgPerMonthMeta.minDateLabel} —{" "}
+                              {entitySummaryKpi.avgPerMonthMeta.maxDateLabel})
+                            </p>
+                          )}
+                      </div>
+                      <span className="shrink-0 tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                        {entitySummaryKpi.avgPerMonth != null
+                          ? formatDataDecimal(entitySummaryKpi.avgPerMonth, 1, 0)
                           : "—"}
                       </span>
                     </div>
-                    <div className="flex items-baseline justify-between gap-4">
-                      <span
-                        className="text-zinc-600 dark:text-zinc-400"
-                        title="Средний помесячный прирост в % к предыдущему календарному месяцу по числу компаний с разобранной датой создания; пустые месяцы в диапазоне считаются как 0. Нужно минимум два календарных месяца в периоде."
-                      >
-                        Темп роста компаний
-                      </span>
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="min-w-0 flex-1">
+                        <span
+                          className="text-zinc-600 dark:text-zinc-400"
+                          title={
+                            entitySummaryKpi.growthRateMeta &&
+                            entitySummaryKpi.dateColumnHeader
+                              ? importEntity === "deals"
+                                ? `По колонке «${entitySummaryKpi.dateColumnHeader}»: для каждого календарного месяца от ${entitySummaryKpi.growthRateMeta.minDateLabel} до ${entitySummaryKpi.growthRateMeta.maxDateLabel} считается, сколько сделок попало в этот месяц; для каждой пары соседних месяцев темп роста % = 100 × (сделок в текущем месяце) / max(сделок в предыдущем, 1). Показатель — среднее арифметическое из ${entitySummaryKpi.growthRateMeta.comparisons} таких помесячных темпов роста (нужно минимум 2 календарных месяца в диапазоне).`
+                                : `По колонке «${entitySummaryKpi.dateColumnHeader}»: то же для числа компаний по месяцам — среднее из помесячных % роста между соседними календарными месяцами в диапазоне дат.`
+                              : "Среднее из помесячных процентов роста числа записей между соседними календарными месяцами."
+                          }
+                        >
+                          Темп роста (среднее помесячных %)
+                        </span>
+                        {entitySummaryKpi.growthRateMeta?.hasPercent && (
+                          <p className="mt-1 text-[11px] leading-snug text-zinc-500 dark:text-zinc-400">
+                            среднее из{" "}
+                            {entitySummaryKpi.growthRateMeta.comparisons} помесячных
+                            % роста ({entitySummaryKpi.growthRateMeta.monthsInTimeline}{" "}
+                            мес. в диапазоне)
+                          </p>
+                        )}
+                        {entitySummaryKpi.growthRateMeta &&
+                          !entitySummaryKpi.growthRateMeta.hasPercent &&
+                          entitySummaryKpi.growthRateMeta.monthsInTimeline > 0 && (
+                            <p className="mt-1 text-[11px] leading-snug text-zinc-500 dark:text-zinc-400">
+                              Нужно минимум два разных календарных месяца в колонке
+                              даты (сейчас{" "}
+                              {entitySummaryKpi.growthRateMeta.monthsInTimeline} мес.).
+                            </p>
+                          )}
+                      </div>
                       <span className="shrink-0 text-right text-sm font-semibold tabular-nums text-zinc-900 dark:text-zinc-50">
-                        {companySummaryKpi.growthRateAvgPercent != null
-                          ? `${companySummaryKpi.growthRateAvgPercent.toLocaleString("ru-RU", {
-                              maximumFractionDigits: 1,
-                              minimumFractionDigits: 0,
-                            })}%`
+                        {entitySummaryKpi.growthRateAvgPercent != null
+                          ? formatDataPercent1(entitySummaryKpi.growthRateAvgPercent)
                           : "—"}
                       </span>
                     </div>
-                    {companySummaryKpi.total > 0 &&
-                      companySummaryKpi.avgPerMonth == null &&
-                      companySummaryKpi.hasDateColumn && (
+                    {entitySummaryKpi.total > 0 &&
+                      entitySummaryKpi.avgPerMonth == null &&
+                      entitySummaryKpi.hasDateColumn && (
                         <p className="text-[11px] leading-snug text-violet-800/90 dark:text-violet-200/90">
-                          Не удалось разобрать даты в колонке создания — среднее
-                          недоступно.
+                          Не удалось разобрать даты в колонке выгрузки — среднее
+                          в месяц недоступно.
                         </p>
                       )}
-                    {!companySummaryKpi.hasResponsibleColumn && (
+                    {!entitySummaryKpi.hasResponsibleColumn && (
                       <p className="text-[11px] leading-snug text-violet-800/90 dark:text-violet-200/90">
                         Нет колонки «Ответственный» — число активных менеджеров
                         недоступно.
                       </p>
                     )}
-                    {!companySummaryKpi.hasDateColumn && (
+                    {!entitySummaryKpi.hasDateColumn && (
                       <p className="text-[11px] leading-snug text-violet-800/90 dark:text-violet-200/90">
-                        Нет колонки «Дата создания» — добавьте её в выгрузку для
-                        расчёта среднего в месяц.
+                        {importEntity === "deals"
+                          ? "Нет колонки даты сделки — добавьте дату закрытия/изменения/создания в выгрузку для расчёта среднего в месяц."
+                          : "Нет колонки «Дата создания» — добавьте её в выгрузку для расчёта среднего в месяц."}
                       </p>
+                    )}
+                  </div>
+                )}
+
+                {importEntity === "deals" && dealsFunnelKpi && (
+                  <div
+                    className="grid gap-2 rounded-xl border border-violet-200/85 bg-violet-50/80 px-3.5 py-3 text-sm dark:border-violet-800/55 dark:bg-violet-950/40"
+                    role="region"
+                    aria-label="Отчёт по сделкам: воронка"
+                  >
+                    <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-violet-800 dark:text-violet-200">
+                      Сделки: итоги
+                    </p>
+                    {!dealsFunnelKpi.hasStageColumn ? (
+                      <>
+                        <p className="text-[11px] leading-snug text-violet-900/90 dark:text-violet-200/90">
+                          Нет колонки стадии сделки в файле — добавьте «Стадия
+                          сделки» в выгрузку, чтобы считать выигранные, проигранные и
+                          конверсию.
+                        </p>
+                        {dealsFunnelKpi.hasAmountColumn &&
+                          dealsFunnelKpi.potentialIncome != null && (
+                            <div className="flex items-baseline justify-between gap-4 border-t border-violet-200/70 pt-2 dark:border-violet-800/45">
+                              <span
+                                className="text-zinc-600 dark:text-zinc-400"
+                                title="Сумма по колонке суммы сделки по всем строкам после фильтров."
+                              >
+                                Потенциальный доход
+                              </span>
+                              <span className="tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                                {formatMoneyRubPie(dealsFunnelKpi.potentialIncome)}
+                              </span>
+                            </div>
+                          )}
+                        {dealsFunnelKpi.avgCheckAll != null && (
+                          <div className="flex items-baseline justify-between gap-4">
+                            <span
+                              className="text-zinc-600 dark:text-zinc-400"
+                              title="Потенциальный доход, делённый на число сделок в выборке."
+                            >
+                              Средний чек
+                            </span>
+                            <span className="tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                              {formatMoneyAvgKpi(dealsFunnelKpi.avgCheckAll)}
+                            </span>
+                          </div>
+                        )}
+                        {!dealsFunnelKpi.hasAmountColumn && (
+                          <p className="text-[11px] leading-snug text-violet-800/90 dark:text-violet-300/85">
+                            Нет подходящей числовой колонки суммы — денежные
+                            показатели недоступны.
+                          </p>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <div className="flex items-baseline justify-between gap-4">
+                          <span className="text-zinc-600 dark:text-zinc-400">
+                            Всего сделок
+                          </span>
+                          <span className="tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                            {formatDataInt(dealsFunnelKpi.total)}
+                          </span>
+                        </div>
+                        <div className="flex items-baseline justify-between gap-4 border-t border-violet-200/70 pt-2 dark:border-violet-800/45">
+                          <span
+                            className="text-zinc-600 dark:text-zinc-400"
+                            title="Не успех и не провал по спискам типовых стадий — в т.ч. промежуточные этапы воронки."
+                          >
+                            В работе
+                          </span>
+                          <span className="tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                            {formatDataInt(dealsFunnelKpi.inProgress)}
+                          </span>
+                        </div>
+                        <div className="flex items-baseline justify-between gap-4">
+                          <span
+                            className="text-zinc-600 dark:text-zinc-400"
+                            title="Стадии успеха по типовым подписям CRM (как в графиках выигранных сделок)."
+                          >
+                            Успешных
+                          </span>
+                          <span className="tabular-nums text-base font-semibold text-emerald-800 dark:text-emerald-200">
+                            {formatDataInt(dealsFunnelKpi.won)}
+                          </span>
+                        </div>
+                        <div className="flex items-baseline justify-between gap-4">
+                          <span
+                            className="text-zinc-600 dark:text-zinc-400"
+                            title="Стадии провала по типовым подписям."
+                          >
+                            Проигранных
+                          </span>
+                          <span className="tabular-nums text-base font-semibold text-rose-800 dark:text-rose-200">
+                            {formatDataInt(dealsFunnelKpi.lost)}
+                          </span>
+                        </div>
+                        <div className="flex items-baseline justify-between gap-4 border-t border-violet-200/70 pt-2 dark:border-violet-800/45">
+                          <span
+                            className="text-zinc-600 dark:text-zinc-400"
+                            title="Доля выигранных среди закрытых (выиграно + проиграно). Если закрытых нет — прочерк."
+                          >
+                            Конверсия
+                          </span>
+                          <span className="shrink-0 text-right text-sm font-semibold tabular-nums text-zinc-900 dark:text-zinc-50">
+                            {dealsFunnelKpi.conversionClosedPercent != null
+                              ? formatDataPercent1(dealsFunnelKpi.conversionClosedPercent)
+                              : "—"}
+                          </span>
+                        </div>
+
+                        <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-violet-800/95 dark:text-violet-200/95">
+                          В деньгах
+                        </p>
+                        {dealsFunnelKpi.hasAmountColumn ? (
+                          <>
+                            <div className="flex items-baseline justify-between gap-4">
+                              <span
+                                className="text-zinc-600 dark:text-zinc-400"
+                                title="Сумма по всем сделкам в выборке (колонка суммы сделки)."
+                              >
+                                Потенциальный доход
+                              </span>
+                              <span className="tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                                {dealsFunnelKpi.potentialIncome != null
+                                  ? formatMoneyRubPie(dealsFunnelKpi.potentialIncome)
+                                  : "—"}
+                              </span>
+                            </div>
+                            <div className="flex items-baseline justify-between gap-4">
+                              <span
+                                className="text-zinc-600 dark:text-zinc-400"
+                                title="Сумма по сделкам «в работе» (не успех и не провал)."
+                              >
+                                Доход в работе
+                              </span>
+                              <span className="tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                                {dealsFunnelKpi.incomeInProgress != null
+                                  ? formatMoneyRubPie(dealsFunnelKpi.incomeInProgress)
+                                  : "—"}
+                              </span>
+                            </div>
+                            <div className="flex items-baseline justify-between gap-4">
+                              <span className="text-zinc-600 dark:text-zinc-400">
+                                Доход от выигранных
+                              </span>
+                              <span className="tabular-nums text-base font-semibold text-emerald-800 dark:text-emerald-200">
+                                {dealsFunnelKpi.incomeWon != null
+                                  ? formatMoneyRubPie(dealsFunnelKpi.incomeWon)
+                                  : "—"}
+                              </span>
+                            </div>
+                            <div className="flex items-baseline justify-between gap-4">
+                              <span
+                                className="text-zinc-600 dark:text-zinc-400"
+                                title="Сумма сделок в проигранных стадиях."
+                              >
+                                Упущенный доход
+                              </span>
+                              <span className="tabular-nums text-base font-semibold text-rose-800 dark:text-rose-200">
+                                {dealsFunnelKpi.incomeLost != null
+                                  ? formatMoneyRubPie(dealsFunnelKpi.incomeLost)
+                                  : "—"}
+                              </span>
+                            </div>
+                            <div className="flex items-start justify-between gap-4 border-t border-violet-200/70 pt-2 dark:border-violet-800/45">
+                              <div className="min-w-0 flex-1">
+                                <span
+                                  className="text-zinc-600 dark:text-zinc-400"
+                                  title="По колонке суммы сделки: в числитель и знаменатель входят только суммы по стадиям «успех» и «провал» (как у строк «Доход от выигранных» и «Упущенный доход»). Сделки «в работе» и их суммы не участвуют. Формула: 100 × (сумма по выигранным) / ((сумма по выигранным) + (сумма по проигранным)). Если знаменатель 0 — прочерк."
+                                >
+                                  Конверсия в деньгах
+                                </span>
+                                <p className="mt-1 text-[11px] leading-snug text-zinc-500 dark:text-zinc-400">
+                                  100 × «Доход от выигранных» / («Доход от
+                                  выигранных» + «Упущенный доход»); без «в работе»
+                                </p>
+                              </div>
+                              <span className="shrink-0 text-right text-sm font-semibold tabular-nums text-zinc-900 dark:text-zinc-50">
+                                {dealsFunnelKpi.conversionMoneyPercent != null
+                                  ? formatDataPercent1(dealsFunnelKpi.conversionMoneyPercent)
+                                  : "—"}
+                              </span>
+                            </div>
+                          </>
+                        ) : (
+                          <p className="text-[11px] leading-snug text-violet-800/90 dark:text-violet-300/85">
+                            Нет числовой колонки суммы сделки — денежные показатели
+                            недоступны.
+                          </p>
+                        )}
+
+                        <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-violet-800/95 dark:text-violet-200/95">
+                          Средние значения
+                        </p>
+                        {dealsFunnelKpi.avgCheckAll != null && (
+                          <div className="flex items-baseline justify-between gap-4 border-t border-violet-200/70 pt-2 dark:border-violet-800/45">
+                            <span
+                              className="text-zinc-600 dark:text-zinc-400"
+                              title="Потенциальный доход по выборке, делённый на число сделок."
+                            >
+                              Средний чек
+                            </span>
+                            <span className="tabular-nums text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                              {formatMoneyAvgKpi(dealsFunnelKpi.avgCheckAll)}
+                            </span>
+                          </div>
+                        )}
+                        {dealsFunnelKpi.avgCheckWon != null && (
+                          <div className="flex items-baseline justify-between gap-4">
+                            <span
+                              className="text-zinc-600 dark:text-zinc-400"
+                              title="Сумма по выигранным, делённая на число выигранных."
+                            >
+                              Средний чек по выигранным
+                            </span>
+                            <span className="tabular-nums text-base font-semibold text-emerald-800 dark:text-emerald-200">
+                              {formatMoneyAvgKpi(dealsFunnelKpi.avgCheckWon)}
+                            </span>
+                          </div>
+                        )}
+                        <div className="flex items-start justify-between gap-4 border-t border-violet-200/70 pt-2 dark:border-violet-800/45">
+                          <div className="min-w-0 flex-1">
+                            <span
+                              className="text-zinc-600 dark:text-zinc-400"
+                              title="Только завершённые сделки (успех или провал по стадии). Для строки: разница календарных дат «Дата создания» → «Дата закрытия» по локальным полуночам (в один календарный день — 0 дней). Среднее — по сделкам, где обе даты распознаны и закрытие не раньше создания; на экране — округление среднего до целых дней."
+                            >
+                              Средний цикл в работе
+                            </span>
+                            <p className="mt-1 text-[11px] leading-snug text-zinc-500 dark:text-zinc-400">
+                              среднее календарных дней от создания до закрытия по
+                              завершённым сделкам
+                              {dealsFunnelKpi.won + dealsFunnelKpi.lost > 0 &&
+                                dealsFunnelKpi.avgDaysInWorkSampleSize <
+                                  dealsFunnelKpi.won + dealsFunnelKpi.lost && (
+                                  <>
+                                    {" "}
+                                    (в расчёте{" "}
+                                    {dealsFunnelKpi.avgDaysInWorkSampleSize} из{" "}
+                                    {dealsFunnelKpi.won + dealsFunnelKpi.lost}{" "}
+                                    закрытых)
+                                  </>
+                                )}
+                            </p>
+                          </div>
+                          <span className="shrink-0 text-right text-base font-semibold tabular-nums text-zinc-900 dark:text-zinc-50">
+                            {dealsFunnelKpi.avgDaysInWork != null
+                              ? `${formatDaysKpiIntegerMean(dealsFunnelKpi.avgDaysInWork)} дн.`
+                              : "—"}
+                          </span>
+                        </div>
+                        {dealsFunnelKpi.hasCreatedDateColumn &&
+                          dealsFunnelKpi.hasClosedDateColumn &&
+                          dealsFunnelKpi.won + dealsFunnelKpi.lost > 0 &&
+                          dealsFunnelKpi.avgDaysInWorkSampleSize === 0 && (
+                            <p className="text-[11px] leading-snug text-violet-800/90 dark:text-violet-200/90">
+                              У закрытых сделок нет пары распознанных дат создания и
+                              закрытия в строках — средний цикл не считается.
+                            </p>
+                          )}
+                        {!dealsFunnelKpi.hasCreatedDateColumn && (
+                          <p className="text-[11px] leading-snug text-violet-800/90 dark:text-violet-200/90">
+                            Нет колонки даты создания сделки — средний цикл не
+                            считается. Добавьте «Дата создания» в выгрузку.
+                          </p>
+                        )}
+                        {dealsFunnelKpi.hasCreatedDateColumn &&
+                          !dealsFunnelKpi.hasClosedDateColumn && (
+                            <p className="text-[11px] leading-snug text-violet-800/90 dark:text-violet-200/90">
+                              Нет колонки даты закрытия — средний цикл не считается.
+                              Добавьте дату закрытия в выгрузку.
+                            </p>
+                          )}
+                        {dealsFunnelKpi.hasCreatedDateColumn &&
+                          dealsFunnelKpi.hasClosedDateColumn &&
+                          !dealsFunnelKpi.cycleUsesDistinctDateColumns && (
+                            <p className="text-[11px] leading-snug text-violet-800/90 dark:text-violet-200/90">
+                              Колонка даты закрытия совпадает с датой создания — для
+                              длительности цикла нужны два разных поля в выгрузке.
+                            </p>
+                          )}
+
+                        <p className="mt-2 text-[10px] leading-snug text-violet-800/85 dark:text-violet-300/85">
+                          Конверсия = выиграно / (выиграно + проиграно). Конверсия в
+                          деньгах = сумма выигранных / (сумма выигранных + сумма
+                          проигранных). Стадии — типовые подписи CRM; суммы — по
+                          колонке «Сумма» (или похожей). Средний цикл в работе —
+                          среднее число календарных дней от даты создания до даты
+                          закрытия только по завершённым сделкам (строки, где обе даты
+                          есть и закрытие не раньше создания).
+                        </p>
+                      </>
                     )}
                   </div>
                 )}
@@ -1337,12 +2097,13 @@ export default function ReportApp() {
                     Сущность выгрузки
                   </legend>
                   <p className="text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
-                    После загрузки файла раздел и графики подбираются по колонкам:
-                    включаются только те пресеты, для которых хватает полей. Раздел
-                    выбирается там, где таких графиков больше всего — при
-                    необходимости смените вручную и отметьте другие графики. Для
-                    отчёта по нескольким разделам переключайте сущность и включайте
-                    нужные пункты в каждом блоке.
+                    После загрузки раздел и графики подбираются по колонкам: только
+                    те пресеты, для которых хватает полей. Если типичный CRM-раздел
+                    не подошёл, выберите «Универсально» — графики по первым
+                    подходящим колонкам без привязки к сценарию. Раздел по умолчанию
+                    — там, где больше всего построимых графиков; при необходимости
+                    смените вручную. Для отчёта по нескольким блокам переключайте
+                    сущность и отмечайте графики в каждом.
                   </p>
                   <div
                     className="grid grid-cols-1 gap-2.5 sm:grid-cols-2"
@@ -1498,7 +2259,7 @@ export default function ReportApp() {
                                           </span>
                                         )}
                                       </div>
-                                      <p className="mt-1.5 line-clamp-2 text-xs leading-snug text-zinc-600 dark:text-zinc-400">
+                                      <p className="mt-1.5 line-clamp-4 text-xs leading-snug text-zinc-600 dark:text-zinc-400">
                                         {spec.description}
                                       </p>
                                       {!resolved.ok && (
@@ -1564,7 +2325,39 @@ export default function ReportApp() {
                 tabular={tabular}
                 filters={globalFilters}
                 onChange={setGlobalFilters}
+                dealStageOrder={dealStageOrder}
               />
+
+              {importEntity === "deals" && (
+                <div className="space-y-2 border-t border-zinc-200/90 pt-5 dark:border-zinc-800">
+                  <label
+                    className={`block ${SECTION_LABEL}`}
+                    htmlFor="deal-stage-order-textarea"
+                  >
+                    Порядок стадий сделки
+                  </label>
+                  <p className="text-[11px] leading-snug text-zinc-500 dark:text-zinc-400">
+                    По одной стадии на строку — как в CRM. Используется для оси X и
+                    легенд, когда график строится по колонке «Стадия сделки» или
+                    «Предыдущая стадия». Пустое поле — встроенный порядок воронки в
+                    приложении. Сохраняется в этом браузере.
+                  </p>
+                  <textarea
+                    id="deal-stage-order-textarea"
+                    className={
+                      INPUT_FIELD +
+                      " min-h-[140px] resize-y font-mono text-xs leading-relaxed"
+                    }
+                    value={dealStageOrderText}
+                    onChange={(e) => setDealStageOrderText(e.target.value)}
+                    placeholder={
+                      "Назначенные заявки\nАнализ ТЗ и документации\nПодготовка КП\nРасчёт БО\nСогласование КП (БО)\nОтправка КП\nДоговор\nСчет\nОплата\nСделка успешна\nОтказ / Тендер проигран"
+                    }
+                    spellCheck={false}
+                    aria-label="Порядок стадий сделки, по одной на строку"
+                  />
+                </div>
+              )}
 
               <div className="space-y-2">
                 <label
@@ -1781,6 +2574,7 @@ export default function ReportApp() {
                             globalFilters={globalFilters}
                             chartSurface={chartSurface}
                             spec={spec}
+                            dealStageOrder={dealStageOrder}
                           />
                         ))}
                       </div>
@@ -1898,19 +2692,21 @@ function PredefinedChartCard({
   tabular,
   globalFilters,
   chartSurface,
+  dealStageOrder,
 }: {
   spec: PredefinedChartSpec;
   specTitle: string;
   tabular: TabularData;
   globalFilters: ChartFilter[];
   chartSurface: ChartSurfaceId;
+  dealStageOrder: string[];
 }) {
   const resolved = spec.resolve(tabular.columns);
   const config =
     resolved.ok
       ? normalizeConfigForTabular(
           tabular,
-          mergeGlobalFilters(resolved.config, globalFilters),
+          mergeGlobalFilters(resolved.config, globalFilters, tabular, spec.id),
         )
       : null;
 
@@ -1935,7 +2731,12 @@ function PredefinedChartCard({
         <span className={chrome.badge} aria-hidden>
           {chrome.letter}
         </span>
-        <h2 className={chrome.title}>{specTitle}</h2>
+        <div className="min-w-0 flex-1">
+          <h2 className={chrome.title}>{specTitle}</h2>
+          <p className="mt-1.5 text-[11px] leading-snug text-zinc-600 dark:text-zinc-400">
+            {spec.description}
+          </p>
+        </div>
       </div>
       <ChartCanvas
         tabular={tabular}
@@ -1943,6 +2744,7 @@ function PredefinedChartCard({
         entity={spec.entity}
         chartId={spec.id}
         chartSurface={chartSurface}
+        dealStageOrder={dealStageOrder}
       />
     </section>
   );
@@ -1954,20 +2756,25 @@ function ChartCanvas({
   entity,
   chartId,
   chartSurface,
+  dealStageOrder,
 }: {
   tabular: TabularData;
   config: ChartConfig;
   entity?: EntityBlockId;
   chartId?: string;
   chartSurface: ChartSurfaceId;
+  dealStageOrder: string[];
 }) {
+  const e = entity ?? "leads";
   const xMetaForChart = config.xKey
     ? tabular.columns.find((c) => c.key === config.xKey)
     : undefined;
-  const isTemporalChart =
+  const xAxisIsTime =
     Boolean(config.xKey) &&
-    xMetaForChart?.inferredType === "date" &&
-    config.chartType !== "pie";
+    xMetaForChart != null &&
+    (xMetaForChart.inferredType === "date" ||
+      (e === "deals" && dealDateColumnLooksLikeTimeAxis(xMetaForChart)));
+  const isTemporalChart = xAxisIsTime && config.chartType !== "pie";
 
   const [periodOverride, setPeriodOverride] = useState<DateGranularity | null>(
     null,
@@ -1986,12 +2793,27 @@ function ChartCanvas({
     [config, effectiveDateGranularity],
   );
 
+  const reportChartThroughYmd =
+    e === "deals" || e === "companies" ? REPORT_INCLUDES_THROUGH_YMD : undefined;
+
   const { data: chartRows, warnings } = useMemo(
-    () => buildAggregatedChartRows(tabular.rows, configForRows, tabular.columns),
-    [tabular.rows, tabular.columns, configForRows],
+    () =>
+      buildAggregatedChartRows(
+        tabular.rows,
+        configForRows,
+        tabular.columns,
+        dealStageOrder.length > 0 ? dealStageOrder : null,
+        reportChartThroughYmd,
+      ),
+    [
+      tabular.rows,
+      tabular.columns,
+      configForRows,
+      dealStageOrder,
+      reportChartThroughYmd,
+    ],
   );
 
-  const e = entity ?? "leads";
   const palette = chartPaletteForEntity(entity);
   const axes = chartUsesDarkSurface(chartSurface)
     ? CHART_AXES_DARK_SURFACE
@@ -2015,12 +2837,19 @@ function ChartCanvas({
   const isHasDealPie =
     chartId === "companies_percent_with_deal" &&
     config.chartType === "pie";
+  const isDealsStageSumPie =
+    chartId === "deals_pie_by_stage" && config.chartType === "pie";
   const pieRows = chartRows.map((r) => ({
     name: String(r.name),
     value: Number(r[config.yKeys[0]!] ?? 0),
   }));
   const pieColorFor = useCallback(
     (name: string, index: number) => {
+      if (isDealsStageSumPie) {
+        return DEALS_STAGE_SUM_PIE_COLORS[
+          index % DEALS_STAGE_SUM_PIE_COLORS.length
+        ]!;
+      }
       if (isResponsibleDistributionPie) {
         return COMPANIES_RESPONSIBLE_PIE_COLORS[
           index % COMPANIES_RESPONSIBLE_PIE_COLORS.length
@@ -2050,33 +2879,41 @@ function ChartCanvas({
       }
       return ["#0ea5e9", "#f59e0b", "#a855f7", "#14b8a6"][index % 4]!;
     },
-    [isResponsibleDistributionPie, isHasDealPie, palette],
+    [isDealsStageSumPie, isResponsibleDistributionPie, isHasDealPie, palette],
   );
 
   const yLegendByKey = useMemo(() => {
     const xMeta = config.xKey
       ? tabular.columns.find((c) => c.key === config.xKey)
       : null;
-    const periodLabel =
-      xMeta?.inferredType === "date"
-        ? effectiveDateGranularity === "month"
-          ? "месяц"
-          : effectiveDateGranularity === "quarter"
-            ? "квартал"
-            : effectiveDateGranularity === "year"
-              ? "год"
-              : "день"
-        : "категория";
+    const xIsTimeLegend =
+      xMeta != null &&
+      (xMeta.inferredType === "date" ||
+        (e === "deals" && dealDateColumnLooksLikeTimeAxis(xMeta)));
+    const periodLabel = xIsTimeLegend
+      ? effectiveDateGranularity === "month"
+        ? "месяц"
+        : effectiveDateGranularity === "quarter"
+          ? "квартал"
+          : effectiveDateGranularity === "year"
+            ? "год"
+            : "день"
+      : "категория";
     const m = new Map<string, string>();
-    for (const key of config.yKeys) {
+    for (let i = 0; i < config.yKeys.length; i++) {
+      const key = config.yKeys[i]!;
+      const columnKey = config.ySourceKeys?.[i] ?? key;
+      const agg =
+        config.yAggregations?.[i] ?? config.aggregation;
       m.set(
         key,
         metricLegendLabel(
           tabular,
-          key,
-          config.aggregation,
+          columnKey,
+          agg,
           periodLabel,
           config.cumulative,
+          e,
         ),
       );
     }
@@ -2084,10 +2921,46 @@ function ChartCanvas({
   }, [
     tabular,
     config.yKeys,
+    config.ySourceKeys,
+    config.yAggregations,
     config.aggregation,
     config.cumulative,
     config.xKey,
     effectiveDateGranularity,
+    e,
+  ]);
+
+  /** Короткие подписи серий в легенде/тултипе (длинные строки из metricLegendLabel). */
+  const seriesDisplayNameByKey = useMemo(() => {
+    const m = new Map<string, string>();
+    for (let i = 0; i < config.yKeys.length; i++) {
+      const k = config.yKeys[i]!;
+      if (chartId === "deals_won_sum_and_count_by_responsible") {
+        const agg = config.yAggregations?.[i];
+        const src = config.ySourceKeys?.[i];
+        const col = src
+          ? tabular.columns.find((c) => c.key === src)
+          : null;
+        const h = col?.header?.trim() ?? "Сумма";
+        if (agg === "sum") {
+          m.set(k, `Сумма (${h}), ₽`);
+        } else if (agg === "count") {
+          m.set(k, "Сделок (выигранных), шт.");
+        } else {
+          m.set(k, yLegendByKey.get(k) ?? k);
+        }
+      } else {
+        m.set(k, yLegendByKey.get(k) ?? k);
+      }
+    }
+    return m;
+  }, [
+    chartId,
+    config.yKeys,
+    config.yAggregations,
+    config.ySourceKeys,
+    tabular.columns,
+    yLegendByKey,
   ]);
 
   const pieIssue =
@@ -2127,39 +3000,43 @@ function ChartCanvas({
   const areaIsSingleSeries =
     config.chartType === "area" && config.yKeys.length === 1;
   const areaChartTopMargin = showPointLabels ? 42 : 28;
-  const renderAreaPointLabel = useCallback(
-    (props: { x?: number; y?: number; value?: unknown }) => {
-      const { x, y, value } = props;
-      if (x == null || y == null) {
-        return null;
-      }
-      const t =
-        typeof value === "number"
-          ? formatTooltipNumber(value)
-          : String(value ?? "");
-      const dark = chartUsesDarkSurface(chartSurface);
-      return (
-        <text
-          x={x}
-          y={y}
-          textAnchor="middle"
-          dy={-14}
-          fontSize={11}
-          fontWeight={600}
-        >
-          <tspan
-            stroke={dark ? "rgba(15,23,42,0.9)" : "rgba(255,255,255,0.96)"}
-            strokeWidth={3}
-            strokeLinejoin="round"
-            paintOrder="stroke"
-            fill={dark ? "#f8fafc" : "#0f172a"}
+  const renderAreaPointLabelForSeries = useCallback(
+    (seriesIndex: number) => {
+      const agg =
+        config.yAggregations?.[seriesIndex] ?? config.aggregation;
+      return (props: { x?: number; y?: number; value?: unknown }) => {
+        const { x, y, value } = props;
+        if (x == null || y == null) {
+          return null;
+        }
+        const t =
+          typeof value === "number"
+            ? formatChartPointLabel(value, agg)
+            : String(value ?? "");
+        const dark = chartUsesDarkSurface(chartSurface);
+        return (
+          <text
+            x={x}
+            y={y}
+            textAnchor="middle"
+            dy={-14}
+            fontSize={11}
+            fontWeight={600}
           >
-            {t}
-          </tspan>
-        </text>
-      );
+            <tspan
+              stroke={dark ? "rgba(15,23,42,0.9)" : "rgba(255,255,255,0.96)"}
+              strokeWidth={3}
+              strokeLinejoin="round"
+              paintOrder="stroke"
+              fill={dark ? "#f8fafc" : "#0f172a"}
+            >
+              {t}
+            </tspan>
+          </text>
+        );
+      };
     },
-    [chartSurface],
+    [chartSurface, config.yAggregations, config.aggregation],
   );
   const barBottom =
     chartReady && config.chartType === "bar"
@@ -2171,6 +3048,20 @@ function ChartCanvas({
       : 14;
   const xAxisAngle =
     chartReady && config.chartType === "bar" && manyBars ? -32 : 0;
+
+  const barDualYAxis =
+    chartReady &&
+    config.chartType === "bar" &&
+    config.yKeys.length === 2 &&
+    config.yAggregations?.length === 2 &&
+    config.yAggregations[0] === "sum" &&
+    config.yAggregations[1] === "count";
+
+  const isWonManagersDualChart =
+    chartId === "deals_won_sum_and_count_by_responsible" && barDualYAxis;
+
+  const primaryYAgg = config.yAggregations?.[0] ?? config.aggregation;
+  const yAxisTickRub = aggregationIsMoney(primaryYAgg);
 
   const renderTooltip = ({
     active,
@@ -2226,9 +3117,29 @@ function ChartCanvas({
         >
           {payload.map((e, i) => {
             const v = e.value;
+            const dk =
+              e.dataKey != null
+                ? String(e.dataKey)
+                : String(config.yKeys[i] ?? "");
+            const yi = config.yKeys.indexOf(dk);
+            const aggForKey =
+              yi >= 0 ? config.yAggregations?.[yi] : undefined;
+            const agg =
+              aggForKey ?? config.aggregation ?? ("sum" as AggregationMode);
             const text =
               typeof v === "number" && Number.isFinite(v)
-                ? formatTooltipNumber(v)
+                ? formatChartTooltipValue(
+                    v,
+                    agg,
+                    chartId,
+                    config.chartType === "pie"
+                      ? "pie"
+                      : config.chartType === "bar"
+                        ? "bar"
+                        : config.chartType === "area"
+                          ? "area"
+                          : "line",
+                  )
                 : v == null
                   ? "—"
                   : String(v);
@@ -2236,9 +3147,10 @@ function ChartCanvas({
             const seriesName =
               config.chartType === "pie" && y0
                 ? (yLegendByKey.get(y0) ?? y0)
-                : e.name != null && e.name !== ""
-                  ? String(e.name)
-                  : `Серия ${i + 1}`;
+                : (seriesDisplayNameByKey.get(dk) ??
+                    (e.name != null && e.name !== ""
+                      ? String(e.name)
+                      : `Серия ${i + 1}`));
             return (
               <li
                 key={i}
@@ -2293,7 +3205,10 @@ function ChartCanvas({
                       {pieRows.map((row, i) => {
                         const c = pieColorFor(row.name, i);
                         const id = `pieSlice-${e}-${i}`;
-                        if (isResponsibleDistributionPie) {
+                        if (
+                          isResponsibleDistributionPie ||
+                          isDealsStageSumPie
+                        ) {
                           return (
                             <radialGradient
                               key={id}
@@ -2347,10 +3262,16 @@ function ChartCanvas({
                       cy="50%"
                       innerRadius={44}
                       outerRadius={
-                        isCompanyTypePie || isHasDealPie ? 118 : 102
+                        isCompanyTypePie ||
+                        isHasDealPie ||
+                        isDealsStageSumPie
+                          ? 118
+                          : 102
                       }
                       paddingAngle={
-                        isResponsibleDistributionPie ? 1.2 : 2.4
+                        isResponsibleDistributionPie || isDealsStageSumPie
+                          ? 1.35
+                          : 2.4
                       }
                       cornerRadius={5}
                       label={
@@ -2387,10 +3308,13 @@ function ChartCanvas({
                                 Number(cy) +
                                 radius * Math.sin(-midAngle * RADIAN);
                               const pct = (percent * 100).toFixed(0);
-                              const count =
+                              const amountLabel =
                                 typeof value === "number" &&
                                 Number.isFinite(value)
-                                  ? formatTooltipNumber(value)
+                                  ? formatChartPointLabel(
+                                      value,
+                                      config.aggregation,
+                                    )
                                   : "0";
                               return (
                                 <text
@@ -2401,10 +3325,10 @@ function ChartCanvas({
                                     x > Number(cx) ? "start" : "end"
                                   }
                                   dominantBaseline="central"
-                                  fontSize={11}
+                                  fontSize={isDealsStageSumPie ? 10 : 11}
                                   fontWeight={700}
                                 >
-                                  {`${count} · ${pct}%`}
+                                  {`${amountLabel} · ${pct}%`}
                                 </text>
                               );
                             }
@@ -2414,11 +3338,17 @@ function ChartCanvas({
                         isHasDealPie ||
                         isResponsibleDistributionPie
                           ? false
-                          : {
-                              stroke: axes.axis,
-                              strokeWidth: 1,
-                              opacity: 0.75,
-                            }
+                          : isDealsStageSumPie
+                            ? {
+                                stroke: axes.axis,
+                                strokeWidth: 1.25,
+                                opacity: 0.9,
+                              }
+                            : {
+                                stroke: axes.axis,
+                                strokeWidth: 1,
+                                opacity: 0.75,
+                              }
                       }
                     >
                       {chartRows.map((_, i) => (
@@ -2426,12 +3356,16 @@ function ChartCanvas({
                           key={`slice-${i}`}
                           fill={`url(#pieSlice-${e}-${i})`}
                           stroke={
-                            isResponsibleDistributionPie
+                            isResponsibleDistributionPie ||
+                            isDealsStageSumPie
                               ? "rgba(255,255,255,0.98)"
                               : "rgba(255,255,255,0.92)"
                           }
                           strokeWidth={
-                            isResponsibleDistributionPie ? 3 : 2.5
+                            isResponsibleDistributionPie ||
+                            isDealsStageSumPie
+                              ? 3
+                              : 2.5
                           }
                         />
                       ))}
@@ -2454,21 +3388,47 @@ function ChartCanvas({
                 pieLegendPayload,
                 axes.tick,
                 pieTotal,
-                { maxHeight: 360, maxWidth: "100%" },
+                {
+                  maxHeight: 360,
+                  maxWidth: "100%",
+                  formatSliceValue: (v) =>
+                    formatChartTooltipValue(
+                      v,
+                      config.aggregation,
+                      chartId,
+                      "pie",
+                    ),
+                },
               )}
             </div>
           </div>
         )}
         {chartReady && config.chartType === "bar" && (
-          <ResponsiveContainer width="100%" height={384}>
+          <div className="space-y-2">
+            {isWonManagersDualChart && (
+              <p className="text-[11px] leading-snug text-violet-800/90 dark:text-violet-200/85">
+                Только стадии успеха из типового списка CRM. У каждого менеджера два
+                столбца: сумма (слева, ₽) и число выигранных сделок (справа, шт.) —
+                шкалы разные.
+              </p>
+            )}
+            <ResponsiveContainer width="100%" height={isWonManagersDualChart ? 400 : 384}>
             <BarChart
               data={chartRows}
-              margin={{ top: 18, right: 18, left: 6, bottom: barBottom }}
-              barCategoryGap="14%"
+              margin={{
+                top: isWonManagersDualChart ? 22 : 18,
+                right: barDualYAxis ? (isWonManagersDualChart ? 58 : 52) : 18,
+                left: isWonManagersDualChart ? 8 : 6,
+                bottom: isWonManagersDualChart ? barBottom + 8 : barBottom,
+              }}
+              barCategoryGap={isWonManagersDualChart ? "18%" : "14%"}
+              barGap={isWonManagersDualChart ? 6 : 4}
             >
               <defs>
                 {config.yKeys.map((_, i) => {
-                  const c = palette[i % palette.length]!;
+                  const c = isWonManagersDualChart
+                    ? palette[(i * 5) % palette.length]!
+                    : palette[i % palette.length]!;
                   const id = `barGrad-${e}-${i}`;
                   return (
                     <linearGradient
@@ -2499,22 +3459,101 @@ function ChartCanvas({
                 axisLine={{ stroke: axes.axis, strokeOpacity: 0.35 }}
                 angle={xAxisAngle}
                 textAnchor={xAxisAngle ? "end" : "middle"}
-                height={xAxisAngle ? 72 : undefined}
+                height={xAxisAngle ? 72 : isWonManagersDualChart ? 56 : undefined}
                 interval={manyBars ? 0 : "preserveStartEnd"}
                 tickMargin={8}
-              />
-              <YAxis
-                tick={tickStyle}
-                stroke={axes.axis}
-                width={52}
-                tickLine={false}
-                axisLine={false}
-                tickFormatter={(v) =>
-                  typeof v === "number"
-                    ? v.toLocaleString("ru-RU", { notation: "compact" })
-                    : String(v)
+                label={
+                  isWonManagersDualChart
+                    ? {
+                        value: "Ответственный",
+                        position: "insideBottom",
+                        offset: -2,
+                        style: {
+                          fill: axes.tick,
+                          fontSize: 11,
+                          fontWeight: 600,
+                        },
+                      }
+                    : undefined
                 }
               />
+              {barDualYAxis ? (
+                <>
+                  <YAxis
+                    yAxisId="sum"
+                    orientation="left"
+                    tick={tickStyle}
+                    stroke={axes.axis}
+                    width={isWonManagersDualChart ? 56 : 52}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) =>
+                      typeof v === "number"
+                        ? formatAxisCompactRub(v)
+                        : String(v)
+                    }
+                    label={
+                      isWonManagersDualChart
+                        ? {
+                            value: "Сумма, ₽",
+                            angle: -90,
+                            position: "insideLeft",
+                            offset: 4,
+                            style: {
+                              fill: axes.tick,
+                              fontSize: 11,
+                              fontWeight: 600,
+                            },
+                          }
+                        : undefined
+                    }
+                  />
+                  <YAxis
+                    yAxisId="count"
+                    orientation="right"
+                    tick={tickStyle}
+                    stroke={axes.axis}
+                    width={isWonManagersDualChart ? 50 : 44}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) =>
+                      typeof v === "number"
+                        ? formatDataInt(v)
+                        : String(v)
+                    }
+                    label={
+                      isWonManagersDualChart
+                        ? {
+                            value: "Сделок, шт.",
+                            angle: 90,
+                            position: "insideRight",
+                            offset: 6,
+                            style: {
+                              fill: axes.tick,
+                              fontSize: 11,
+                              fontWeight: 600,
+                            },
+                          }
+                        : undefined
+                    }
+                  />
+                </>
+              ) : (
+                <YAxis
+                  tick={tickStyle}
+                  stroke={axes.axis}
+                  width={52}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={(v) =>
+                    typeof v === "number"
+                      ? yAxisTickRub
+                        ? formatAxisCompactRub(v)
+                        : formatAxisCompact(v)
+                      : String(v)
+                  }
+                />
+              )}
               <Tooltip
                 content={renderTooltip as never}
                 cursor={{ fill: "rgba(99, 102, 241, 0.06)" }}
@@ -2527,15 +3566,29 @@ function ChartCanvas({
               {config.yKeys.map((k, i) => (
                 <Bar
                   key={k}
+                  yAxisId={
+                    barDualYAxis
+                      ? config.yAggregations![i] === "count"
+                        ? "count"
+                        : "sum"
+                      : undefined
+                  }
                   dataKey={k}
-                  name={yLegendByKey.get(k)}
+                  name={seriesDisplayNameByKey.get(k) ?? yLegendByKey.get(k)}
                   fill={`url(#barGrad-${e}-${i})`}
-                  radius={[10, 10, 0, 0]}
-                  maxBarSize={58}
+                  radius={
+                    isWonManagersDualChart
+                      ? config.yAggregations![i] === "count"
+                        ? [6, 6, 0, 0]
+                        : [12, 12, 0, 0]
+                      : [10, 10, 0, 0]
+                  }
+                  maxBarSize={isWonManagersDualChart ? 52 : 58}
                 />
               ))}
             </BarChart>
           </ResponsiveContainer>
+          </div>
         )}
         {chartReady && config.chartType === "line" && (
           <ResponsiveContainer width="100%" height={384}>
@@ -2565,7 +3618,9 @@ function ChartCanvas({
                 axisLine={false}
                 tickFormatter={(v) =>
                   typeof v === "number"
-                    ? v.toLocaleString("ru-RU", { notation: "compact" })
+                    ? yAxisTickRub
+                      ? formatAxisCompactRub(v)
+                      : formatAxisCompact(v)
                     : String(v)
                 }
               />
@@ -2606,7 +3661,12 @@ function ChartCanvas({
                       fill={axes.tick}
                       fontSize={11}
                       formatter={(v: unknown) =>
-                        typeof v === "number" ? formatTooltipNumber(v) : String(v ?? "")
+                        typeof v === "number"
+                          ? formatChartPointLabel(
+                              v,
+                              config.yAggregations?.[i] ?? config.aggregation,
+                            )
+                          : String(v ?? "")
                       }
                     />
                   )}
@@ -2671,7 +3731,9 @@ function ChartCanvas({
                   axisLine={false}
                   tickFormatter={(v) =>
                     typeof v === "number"
-                      ? v.toLocaleString("ru-RU", { notation: "compact" })
+                      ? yAxisTickRub
+                        ? formatAxisCompactRub(v)
+                        : formatAxisCompact(v)
                       : String(v)
                   }
                 />
@@ -2727,7 +3789,7 @@ function ChartCanvas({
                         <LabelList
                           dataKey={k}
                           position="top"
-                          content={renderAreaPointLabel as never}
+                          content={renderAreaPointLabelForSeries(i) as never}
                         />
                       )}
                     </Line>
@@ -2788,7 +3850,9 @@ function ChartCanvas({
                   axisLine={false}
                   tickFormatter={(v) =>
                     typeof v === "number"
-                      ? v.toLocaleString("ru-RU", { notation: "compact" })
+                      ? yAxisTickRub
+                        ? formatAxisCompactRub(v)
+                        : formatAxisCompact(v)
                       : String(v)
                   }
                 />
@@ -2833,7 +3897,7 @@ function ChartCanvas({
                         dataKey={k}
                         position="top"
                         offset={10}
-                        content={renderAreaPointLabel as never}
+                        content={renderAreaPointLabelForSeries(i) as never}
                       />
                     )}
                   </Area>
@@ -2877,18 +3941,6 @@ function ChartCanvas({
                 );
               })}
             </div>
-            {periodOverride !== null && (
-              <button
-                type="button"
-                onClick={() => setPeriodOverride(null)}
-                className={
-                  BTN_GHOST +
-                  " ml-auto shrink-0 px-3 py-1.5 text-xs font-medium text-zinc-600 dark:text-zinc-300"
-                }
-              >
-                Как в отчёте
-              </button>
-            )}
           </div>
         )}
       </div>
@@ -2898,12 +3950,12 @@ function ChartCanvas({
 
 function formatCell(v: unknown): string {
   if (v instanceof Date) {
-    return formatDateYmdLocal(v);
+    return formatDateTimeDdMmYyyyRuLocal(v);
   }
   if (typeof v === "string") {
     const d = tryParseDate(v);
     if (d) {
-      return formatDateYmdLocal(d);
+      return formatDateTimeDdMmYyyyRuLocal(d);
     }
   }
   if (v === null || v === undefined) {
@@ -2966,9 +4018,15 @@ type FilterBlockProps = {
   tabular: TabularData;
   filters: ChartFilter[];
   onChange: (f: ChartFilter[]) => void;
+  dealStageOrder: string[];
 };
 
-function FilterBlock({ tabular, filters, onChange }: FilterBlockProps) {
+function FilterBlock({
+  tabular,
+  filters,
+  onChange,
+  dealStageOrder,
+}: FilterBlockProps) {
   const patchFilter = useCallback(
     (index: number, patch: Partial<ChartFilter>) => {
       onChange(
@@ -3033,6 +4091,7 @@ function FilterBlock({ tabular, filters, onChange }: FilterBlockProps) {
                 onRemove={() =>
                   onChange(filters.filter((_, i) => i !== index))
                 }
+                dealStageOrder={dealStageOrder}
               />
             </li>
           ))}
@@ -3059,6 +4118,7 @@ function FilterConditionRow({
   onSetColumnKey,
   onPatch,
   onRemove,
+  dealStageOrder,
 }: {
   tabular: TabularData;
   filter: ChartFilter;
@@ -3067,6 +4127,7 @@ function FilterConditionRow({
   onSetColumnKey: (columnKey: string) => void;
   onPatch: (patch: Partial<ChartFilter>) => void;
   onRemove: () => void;
+  dealStageOrder: string[];
 }) {
   const columnKey = filter.columnKey;
   const meta = tabular.columns.find((c) => c.key === columnKey);
@@ -3083,8 +4144,10 @@ function FilterConditionRow({
     if (meta.inferredType === "number" || meta.inferredType === "date") {
       return [];
     }
-    return distinctStringValues(baseRows, columnKey, 200);
-  }, [baseRows, columnKey, meta]);
+    const orderArg =
+      dealStageOrder.length > 0 ? dealStageOrder : null;
+    return distinctStringValues(baseRows, columnKey, 200, meta, orderArg);
+  }, [baseRows, columnKey, meta, dealStageOrder]);
 
   const calendarMonthOptions = useMemo(() => {
     if (!columnKey || meta?.inferredType !== "date") {

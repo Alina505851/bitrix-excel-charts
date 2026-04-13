@@ -8,8 +8,16 @@ import {
   tryParseNumber,
   tryParseDate,
   groupLabel,
+  EMPTY_GROUP_LABEL,
   formatDateYmdLocal,
+  formatDateDdMmYyyyRuLocal,
 } from "@/lib/chart/coerce";
+import {
+  isDealStageLikeColumn,
+  sortDealPipelineStageKeys,
+  getEffectiveDealStageOrder,
+  sortDealStageKeysDefault,
+} from "@/lib/chart/dealStageOrder";
 
 const RU_MONTHS_SHORT = [
   "янв.",
@@ -134,9 +142,36 @@ export function applyFilters(
         continue;
       }
       const raw = row[f.columnKey];
-      if (f.values && f.values.length > 0) {
+      const hasWhitelist = f.values && f.values.length > 0;
+      const hasFragmentPick =
+        (f.valuesContainAll && f.valuesContainAll.length > 0) ||
+        (f.valuesContainAny && f.valuesContainAny.length > 0);
+      const hasBlacklist = f.excludeValues && f.excludeValues.length > 0;
+      if (hasWhitelist || hasFragmentPick || hasBlacklist) {
         const s = groupLabel(raw);
-        if (!f.values.includes(s)) {
+        const lower = s.toLowerCase();
+        if (hasWhitelist && f.values && !f.values.includes(s)) {
+          return false;
+        }
+        if (!hasWhitelist && hasFragmentPick) {
+          if (
+            f.valuesContainAll?.length &&
+            !f.valuesContainAll.every((frag) =>
+              lower.includes(frag.toLowerCase()),
+            )
+          ) {
+            return false;
+          }
+          if (
+            f.valuesContainAny?.length &&
+            !f.valuesContainAny.some((frag) =>
+              lower.includes(frag.toLowerCase()),
+            )
+          ) {
+            return false;
+          }
+        }
+        if (hasBlacklist && f.excludeValues?.includes(s)) {
           return false;
         }
       }
@@ -233,18 +268,168 @@ function yCellNonempty(raw: unknown): boolean {
 
 export type ChartRow = Record<string, string | number>;
 
+/** Сравнимое время начала периода для ключей оси X из normalizeXValue (день / месяц / квартал / год). */
+function timelineKeyToSortTime(s: string): number | null {
+  const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (ymd) {
+    return Date.UTC(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]));
+  }
+  const ym = /^(\d{4})-(\d{2})$/.exec(s);
+  if (ym) {
+    return Date.UTC(Number(ym[1]), Number(ym[2]) - 1, 1);
+  }
+  const yq = /^(\d{4})-Q([1-4])$/i.exec(s);
+  if (yq) {
+    const mo = (Number(yq[2]) - 1) * 3;
+    return Date.UTC(Number(yq[1]), mo, 1);
+  }
+  const yOnly = /^(\d{4})$/.exec(s);
+  if (yOnly) {
+    return Date.UTC(Number(yOnly[1]), 0, 1);
+  }
+  return null;
+}
+
+function compareChronologicalXKeys(a: string, b: string): number {
+  const ta = timelineKeyToSortTime(a);
+  const tb = timelineKeyToSortTime(b);
+  if (ta !== null && tb !== null) {
+    return ta - tb;
+  }
+  if (ta !== null) {
+    return -1;
+  }
+  if (tb !== null) {
+    return 1;
+  }
+  return a.localeCompare(b, "ru", { numeric: true });
+}
+
+function shouldSortXKeysChronologically(
+  xMeta: ColumnMeta,
+  rawKeys: string[],
+): boolean {
+  if (xMeta.inferredType === "date") {
+    return true;
+  }
+  if (rawKeys.length === 0) {
+    return false;
+  }
+  return rawKeys.every((k) => timelineKeyToSortTime(k) !== null);
+}
+
 export function buildAggregatedChartRows(
   rows: Record<string, unknown>[],
   config: ChartConfig,
   columns: ColumnMeta[],
+  /** Порядок подписей стадий сделки (из UI); только для колонок стадии, см. `isDealStageLikeColumn`. */
+  dealStageOrder?: string[] | null,
+  /**
+   * Если задано (YYYY-MM-DD), строки, у которых ось X распознаётся как календарная дата позже
+   * этого дня, не учитываются (графики компаний и сделок).
+   */
+  maxXCellCalendarDayYmd?: string,
 ): { data: ChartRow[]; warnings: string[] } {
   const warnings: string[] = [];
   const { xKey, yKeys, aggregation } = config;
-  if (!xKey || yKeys.length === 0) {
+  if (yKeys.length === 0) {
     return { data: [], warnings };
+  }
+  if (
+    config.ySourceKeys &&
+    config.ySourceKeys.length !== yKeys.length
+  ) {
+    warnings.push("Длина ySourceKeys не совпадает с yKeys — источники серий проигнорированы.");
+  }
+  const ySourceKeys =
+    config.ySourceKeys && config.ySourceKeys.length === yKeys.length
+      ? config.ySourceKeys
+      : undefined;
+  if (
+    config.yAggregations &&
+    config.yAggregations.length !== yKeys.length
+  ) {
+    warnings.push("Длина yAggregations не совпадает с yKeys — для части серий используется общий aggregation.");
   }
 
   const colMap = metaByKeyMap(columns);
+
+  if (config.literalAvgBars && config.literalAvgBars.length > 0) {
+    for (const bar of config.literalAvgBars) {
+      if (!yKeys.includes(bar.seriesKey)) {
+        warnings.push(
+          "literalAvgBars: seriesKey должен совпадать с одним из yKeys.",
+        );
+        return { data: [], warnings };
+      }
+    }
+    const filtered = applyFilters(rows, config.filters);
+    if (filtered.length === 0) {
+      warnings.push("После фильтров не осталось строк.");
+      return { data: [], warnings };
+    }
+    const data: ChartRow[] = [];
+    for (const lit of config.literalAvgBars) {
+      const sub = applyFilters(filtered, lit.filters);
+      let sum = 0;
+      let c = 0;
+      for (const row of sub) {
+        const num = tryParseNumber(row[lit.valueKey]);
+        if (num !== null && Number.isFinite(num)) {
+          sum += num;
+          c += 1;
+        }
+      }
+      const avg = c > 0 ? sum / c : 0;
+      const point: ChartRow = { name: lit.label };
+      for (const yk of yKeys) {
+        point[yk] = yk === lit.seriesKey ? avg : 0;
+      }
+      data.push(point);
+    }
+    return { data, warnings };
+  }
+
+  if (config.literalPieComplement) {
+    const lpc = config.literalPieComplement;
+    if (config.chartType !== "pie" || !xKey) {
+      warnings.push(
+        "literalPieComplement: нужны chartType «pie» и непустой xKey.",
+      );
+      return { data: [], warnings };
+    }
+    if (lpc.repeatMatchAny.length === 0) {
+      warnings.push("literalPieComplement: задайте хотя бы одно условие в repeatMatchAny.");
+      return { data: [], warnings };
+    }
+    const filtered = applyFilters(rows, config.filters);
+    const nonEmpty = filtered.filter(
+      (row) => groupLabel(row[xKey]) !== EMPTY_GROUP_LABEL,
+    );
+    const yk = yKeys[0]!;
+    let repeatCount = 0;
+    let nonRepeatCount = 0;
+    for (const row of nonEmpty) {
+      const isRepeat = lpc.repeatMatchAny.some(
+        (f) => applyFilters([row], [f]).length === 1,
+      );
+      if (isRepeat) {
+        repeatCount += 1;
+      } else {
+        nonRepeatCount += 1;
+      }
+    }
+    const data: ChartRow[] = [
+      { name: lpc.repeatLabel, [yk]: repeatCount },
+      { name: lpc.nonRepeatLabel, [yk]: nonRepeatCount },
+    ];
+    return { data, warnings };
+  }
+
+  if (!xKey) {
+    return { data: [], warnings };
+  }
+
   const xMeta = colMap.get(xKey);
   if (!xMeta) {
     warnings.push("Ось X не найдена в данных.");
@@ -256,16 +441,47 @@ export function buildAggregatedChartRows(
     warnings.push("После фильтров не осталось строк.");
     return { data: [], warnings };
   }
+  const rowsForAggregation =
+    config.countDistinctByKey && config.countDistinctByKey.trim()
+      ? (() => {
+          const distinctKey = config.countDistinctByKey!;
+          const seen = new Set<string>();
+          const out: Record<string, unknown>[] = [];
+          for (const row of filtered) {
+            const raw = row[distinctKey];
+            const id = raw == null ? "" : String(raw).trim();
+            if (!id) {
+              out.push(row);
+              continue;
+            }
+            if (seen.has(id)) {
+              continue;
+            }
+            seen.add(id);
+            out.push(row);
+          }
+          return out;
+        })()
+      : filtered;
 
   const groups = new Map<string, GroupAccum>();
   const granularity = config.dateGranularity ?? "day";
 
-  for (const row of filtered) {
+  for (const row of rowsForAggregation) {
+    if (maxXCellCalendarDayYmd) {
+      const cellYmd = rowValueAsYmd(row[xKey]);
+      if (cellYmd && cellYmd > maxXCellCalendarDayYmd) {
+        continue;
+      }
+    }
     const gx = normalizeXValue(
       row[xKey],
       xMeta.inferredType,
       granularity,
     );
+    if (gx.key === EMPTY_GROUP_LABEL) {
+      continue;
+    }
     const key = gx.key;
     let g = groups.get(key);
     if (!g) {
@@ -273,13 +489,16 @@ export function buildAggregatedChartRows(
       groups.set(key, g);
     }
     g.count += 1;
-    for (const yk of yKeys) {
-      if (!g.sums[yk]) {
+    for (let i = 0; i < yKeys.length; i++) {
+      const yk = yKeys[i]!;
+      const sourceKey = ySourceKeys ? ySourceKeys[i]! : yk;
+      // Нельзя использовать !g.sums[yk]: при сумме 0 сбрасывались counts/filled (ломались avg и count_nonempty).
+      if (g.sums[yk] === undefined) {
         g.sums[yk] = 0;
         g.counts[yk] = 0;
         g.filled[yk] = 0;
       }
-      const rawY = row[yk];
+      const rawY = row[sourceKey];
       const num = tryParseNumber(rawY);
       if (num !== null) {
         g.sums[yk] += num;
@@ -291,22 +510,44 @@ export function buildAggregatedChartRows(
     }
   }
 
-  const sortKeys = Array.from(groups.keys()).sort((a, b) =>
-    a.localeCompare(b, "ru", { numeric: true }),
-  );
+  const rawKeys = Array.from(groups.keys());
+  const effectiveStageOrder = getEffectiveDealStageOrder(dealStageOrder);
+  const sortKeys =
+    isDealStageLikeColumn(xMeta) && effectiveStageOrder?.length
+      ? sortDealPipelineStageKeys(rawKeys, effectiveStageOrder)
+      : isDealStageLikeColumn(xMeta)
+        ? sortDealStageKeysDefault(rawKeys)
+        : shouldSortXKeysChronologically(xMeta, rawKeys)
+          ? [...rawKeys].sort(compareChronologicalXKeys)
+          : rawKeys.sort((a, b) => a.localeCompare(b, "ru", { numeric: true }));
+  const sortKeysClampedByReportDate =
+    maxXCellCalendarDayYmd && shouldSortXKeysChronologically(xMeta, rawKeys)
+      ? (() => {
+          const maxTime = timelineKeyToSortTime(maxXCellCalendarDayYmd);
+          if (maxTime === null) {
+            return sortKeys;
+          }
+          return sortKeys.filter((k) => {
+            const kt = timelineKeyToSortTime(k);
+            return kt !== null && kt <= maxTime;
+          });
+        })()
+      : sortKeys;
 
-  const data: ChartRow[] = sortKeys.map((k) => {
+  const data: ChartRow[] = sortKeysClampedByReportDate.map((k) => {
     const g = groups.get(k)!;
     const point: ChartRow = { name: g.xLabel };
-    for (const yk of yKeys) {
+    for (let i = 0; i < yKeys.length; i++) {
+      const yk = yKeys[i]!;
+      const agg = config.yAggregations?.[i] ?? aggregation;
       const sum = g.sums[yk] ?? 0;
       const c = g.counts[yk] ?? 0;
       let v = 0;
-      if (aggregation === "sum") {
+      if (agg === "sum") {
         v = sum;
-      } else if (aggregation === "avg") {
+      } else if (agg === "avg") {
         v = c > 0 ? sum / c : 0;
-      } else if (aggregation === "count_nonempty") {
+      } else if (agg === "count_nonempty") {
         v = g.filled[yk] ?? 0;
       } else {
         v = g.count;
@@ -321,7 +562,8 @@ export function buildAggregatedChartRows(
       yKeys.map((yk) => [yk, 0]),
     );
     for (const point of data) {
-      for (const yk of yKeys) {
+      for (let i = 0; i < yKeys.length; i++) {
+        const yk = yKeys[i]!;
         const add = typeof point[yk] === "number" ? point[yk] : 0;
         runs[yk] += add;
         point[yk] = runs[yk];
@@ -364,7 +606,8 @@ function normalizeXValue(
     }
     if (inferred === "date" || dateGranularity === "day") {
       const ymd = formatDateYmdLocal(parsed);
-      return { key: ymd, label: ymd };
+      const label = formatDateDdMmYyyyRuLocal(parsed);
+      return { key: ymd, label };
     }
   }
 
@@ -372,7 +615,7 @@ function normalizeXValue(
     const d = raw instanceof Date ? raw : tryParseDate(raw);
     if (d) {
       const ymd = formatDateYmdLocal(d);
-      return { key: ymd, label: ymd };
+      return { key: ymd, label: formatDateDdMmYyyyRuLocal(d) };
     }
   }
 
@@ -384,6 +627,8 @@ export function distinctStringValues(
   rows: Record<string, unknown>[],
   columnKey: string,
   limit = 200,
+  columnMeta?: ColumnMeta,
+  dealStageOrder?: string[] | null,
 ): string[] {
   const set = new Set<string>();
   for (const row of rows) {
@@ -392,5 +637,12 @@ export function distinctStringValues(
       break;
     }
   }
-  return Array.from(set).sort((a, b) => a.localeCompare(b, "ru"));
+  const arr = Array.from(set);
+  if (columnMeta && isDealStageLikeColumn(columnMeta)) {
+    const effectiveStageOrder = getEffectiveDealStageOrder(dealStageOrder);
+    return effectiveStageOrder?.length
+      ? sortDealPipelineStageKeys(arr, effectiveStageOrder)
+      : sortDealStageKeysDefault(arr);
+  }
+  return arr.sort((a, b) => a.localeCompare(b, "ru"));
 }

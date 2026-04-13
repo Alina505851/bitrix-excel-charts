@@ -4,13 +4,15 @@ import type {
   ColumnMeta,
   TabularData,
 } from "@/lib/types";
+import { groupLabel, tryParseDate } from "@/lib/chart/coerce";
 
 export type EntityBlockId =
   | "leads"
   | "deals"
   | "contacts"
   | "companies"
-  | "quotes";
+  | "quotes"
+  | "generic";
 
 export const ENTITY_BLOCKS: {
   id: EntityBlockId;
@@ -27,7 +29,7 @@ export const ENTITY_BLOCKS: {
     id: "deals",
     label: "Сделки",
     description:
-      "Стадии, суммы, контакты и менеджеры; выигранные сделки отдельными графиками; воронка, средний чек, динамика.",
+      "Стадии, суммы, контакты и менеджеры; топ по сделкам в работе и по успешным; динамика выручки и средней сделки; КП; воронка.",
   },
   {
     id: "contacts",
@@ -39,13 +41,19 @@ export const ENTITY_BLOCKS: {
     id: "companies",
     label: "Компании",
     description:
-      "Отрасль, тип, локация, UTM, источник, бренд, путь клиента, активность, КП и типовые поля выгрузки Битрикс24.",
+      "Отрасль, тип, локация, UTM, источник, бренд, активность и типовые поля корпоративных выгрузок.",
   },
   {
     id: "quotes",
     label: "Комм. предложения (КП)",
     description:
-      "Выгрузка КП из CRM: по месяцам только отправленные предложения с заполненной суммой.",
+      "Выгрузка коммерческих предложений: суммы и статусы по периодам.",
+  },
+  {
+    id: "generic",
+    label: "Универсально",
+    description:
+      "Любая таблица Excel: столбчатые и линейные графики по первым подходящим колонкам (категория, число, дата) без привязки к конкретной CRM.",
   },
 ];
 
@@ -118,6 +126,9 @@ function pickColumn(
     if (hit) {
       return hit;
     }
+    // Не подставлять pool[0]: иначе при несовпадении подписи берётся первая колонка типа
+    // (например «Дата изменения» вместо «Дата создания») и KPI/графики врут.
+    return null;
   }
   return pool[0] ?? null;
 }
@@ -145,6 +156,19 @@ function firstNumberColumn(columns: ColumnMeta[]): ColumnMeta | null {
   return metricPool[0] ?? null;
 }
 
+/** Первая колонка-категория по порядку в файле (универсальные пресеты). */
+function firstCategoryColumnGeneric(columns: ColumnMeta[]): ColumnMeta | null {
+  for (const c of columns) {
+    if (
+      (c.inferredType === "string" || c.inferredType === "unknown") &&
+      !isLikelyIdentifierColumn(c)
+    ) {
+      return c;
+    }
+  }
+  return null;
+}
+
 function stageColumnLeads(columns: ColumnMeta[]): ColumnMeta | null {
   return (
     pickColumn(columns, {
@@ -160,7 +184,7 @@ function stageColumnLeads(columns: ColumnMeta[]): ColumnMeta | null {
   );
 }
 
-function stageColumnDeals(columns: ColumnMeta[]): ColumnMeta | null {
+export function stageColumnDeals(columns: ColumnMeta[]): ColumnMeta | null {
   return (
     pickColumn(columns, {
       types: ["string", "unknown"],
@@ -194,7 +218,7 @@ function dateLikeColumn(columns: ColumnMeta[]): ColumnMeta | null {
   );
 }
 
-function amountLikeColumn(columns: ColumnMeta[]): ColumnMeta | null {
+export function amountLikeColumn(columns: ColumnMeta[]): ColumnMeta | null {
   const metricPool = columns.filter(
     (c) => c.inferredType === "number" && !isLikelyIdentifierColumn(c),
   );
@@ -387,32 +411,42 @@ function employeeIdLikeColumn(columns: ColumnMeta[]): ColumnMeta | null {
   );
 }
 
+/**
+ * Общие точные подписи колонки «дата создания» (без привязки к сущности).
+ * Компании и сделки используют одну схему: одна сущностная подпись + этот список.
+ */
+const CREATED_DATE_EXACT_HEADERS_COMMON: readonly string[] = [
+  "дата создания",
+  "дата регистрации",
+  "дата и время создания",
+  "дата/время создания",
+  "created at",
+  "created_at",
+  "date created",
+  "registration date",
+];
+
+const COMPANY_CREATED_DATE_EXACT_HEADERS: readonly string[] = [
+  "дата создания компании",
+  ...CREATED_DATE_EXACT_HEADERS_COMMON,
+];
+
+const DEAL_CREATED_DATE_EXACT_HEADERS: readonly string[] = [
+  "дата создания сделки",
+  ...CREATED_DATE_EXACT_HEADERS_COMMON,
+];
+
 /** Дата похожа на «дата создания компании» в выгрузке Битрикс24 */
 export function companyCreatedDateColumn(columns: ColumnMeta[]): ColumnMeta | null {
+  const headers = [...COMPANY_CREATED_DATE_EXACT_HEADERS];
   return (
     pickStrictHeaderColumn(columns, {
       types: ["date"],
-      exactHeaders: [
-        "дата создания компании",
-        "дата создания",
-        "дата регистрации",
-        "created at",
-        "created_at",
-        "date created",
-        "registration date",
-      ],
+      exactHeaders: headers,
     }) ??
     pickStrictHeaderColumn(columns, {
       types: ["string"],
-      exactHeaders: [
-        "дата создания компании",
-        "дата создания",
-        "дата регистрации",
-        "created at",
-        "created_at",
-        "date created",
-        "registration date",
-      ],
+      exactHeaders: headers,
     })
   );
 }
@@ -514,6 +548,21 @@ function companyBudgetKpColumn(columns: ColumnMeta[]): ColumnMeta | null {
     types: ["number"],
     exactHeaders: ["бюджет кп", "бюджет планируемый"],
   });
+}
+
+/** Сумма / стоимость КП в выгрузке сделки (или запасной «Бюджет КП»). */
+export function dealKpAmountColumn(columns: ColumnMeta[]): ColumnMeta | null {
+  return (
+    pickStrictHeaderColumn(columns, {
+      types: ["number"],
+      exactHeaders: [
+        "сумма кп",
+        "стоимость кп",
+        "сумма коммерческого предложения",
+        "стоимость коммерческого предложения",
+      ],
+    }) ?? companyBudgetKpColumn(columns)
+  );
 }
 
 /** Бизнес-метрика компании для сумм по менеджерам (не ID и не технические числа). */
@@ -688,6 +737,9 @@ const WON_DEAL_STAGE_VALUES: string[] = [
   "УСПЕШНО РЕАЛИЗОВАНА",
   "Успешная сделка",
   "успешная сделка",
+  "10. Сделка успешна",
+  "Сделка успешна",
+  "сделка успешна",
   "WON",
   "won",
   "Won",
@@ -702,51 +754,287 @@ const WON_DEAL_STAGE_VALUES: string[] = [
   "успех",
 ];
 
+/**
+ * Типичные неуспешные финальные стадии (Битрикс24 и похожие выгрузки).
+ * Для строки, не попавшей сюда и не в WON, считаем сделку «в работе».
+ */
+const LOST_DEAL_STAGE_VALUES: string[] = [
+  "11. Отказ / Тендер проигран",
+  "Отказ / Тендер проигран",
+  "Отказ",
+  "отказ",
+  "Провал",
+  "провал",
+  "Неуспех",
+  "неуспех",
+  "LOST",
+  "lost",
+  "Lost",
+  "CLOSED LOST",
+  "Closed Lost",
+  "Не реализована",
+  "не реализована",
+  "Сделка проиграна",
+  "сделка проиграна",
+  "Проиграна",
+  "проиграна",
+  "Закрыта без успеха",
+  "Тендер проигран",
+];
+
+function normStageMatch(s: string): string {
+  return s.trim().toLowerCase().replace(/ё/g, "е");
+}
+
+export function isWonDealStageLabel(displayLabel: string): boolean {
+  const n = normStageMatch(displayLabel);
+  if (n === "" || n === "(пусто)") {
+    return false;
+  }
+  return WON_DEAL_STAGE_VALUES.some((v) => normStageMatch(v) === n);
+}
+
+export function isLostDealStageLabel(displayLabel: string): boolean {
+  const n = normStageMatch(displayLabel);
+  if (n === "" || n === "(пусто)") {
+    return false;
+  }
+  return LOST_DEAL_STAGE_VALUES.some((v) => normStageMatch(v) === n);
+}
+
+/**
+ * Итог по стадии сделки для сводки: успех и проверяются первыми.
+ */
+export function dealStageOutcomeFromCell(raw: unknown): "won" | "lost" | "open" {
+  const label = groupLabel(raw);
+  if (isWonDealStageLabel(label)) {
+    return "won";
+  }
+  if (isLostDealStageLabel(label)) {
+    return "lost";
+  }
+  return "open";
+}
+
 function wonDealStageFilters(stageKey: string): ChartFilter[] {
   return [{ columnKey: stageKey, values: [...WON_DEAL_STAGE_VALUES] }];
 }
 
-/** 1 квартал 2026 г. (январь–март включительно) по колонке даты в выгрузке. */
-const DEALS_Q1_2026_FROM = "2026-01-01";
-const DEALS_Q1_2026_TO = "2026-03-31";
-
-function wonDealQ1_2026Filters(
-  stage: ColumnMeta,
-  dateCol: ColumnMeta,
-): ChartFilter[] {
+/** Стадии «в работе»: не успех и не провал по тем же спискам, что и для выигранных/проигранных. */
+function openDealStageFilters(stageKey: string): ChartFilter[] {
   return [
-    ...wonDealStageFilters(stage.key),
     {
-      columnKey: dateCol.key,
-      dateFrom: DEALS_Q1_2026_FROM,
-      dateTo: DEALS_Q1_2026_TO,
+      columnKey: stageKey,
+      excludeValues: [...WON_DEAL_STAGE_VALUES, ...LOST_DEAL_STAGE_VALUES],
     },
   ];
 }
 
-/** Дата для динамики сделок: закрытие / изменение / создание. */
-function dealClosedDateColumn(columns: ColumnMeta[]): ColumnMeta | null {
+/** Заголовок для точного сравнения: BOM, NBSP → пробел, схлопывание пробелов, lower. */
+function headerKeyForExactMatch(h: string): string {
+  return h
+    .replace(/^\uFEFF/, "")
+    .replace(/\u00a0/g, " ")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function columnsMatchingExactHeaderList(
+  columns: ColumnMeta[],
+  exactHeaders: readonly string[],
+): ColumnMeta[] {
+  const want = new Set(exactHeaders.map((h) => headerKeyForExactMatch(h)));
+  return columns.filter(
+    (c) =>
+      want.has(headerKeyForExactMatch(c.header)) ||
+      want.has(headerKeyForExactMatch(c.key)),
+  );
+}
+
+/** Среди колонок с одинаковой подписью выбираем ту, где больше всего дат в строках/тексте (не числа-ID). */
+function pickCreatedDateColumnBySample(
+  candidates: ColumnMeta[],
+  sampleRows: Record<string, unknown>[],
+): ColumnMeta | null {
+  if (candidates.length === 0) {
+    return null;
+  }
+  if (candidates.length === 1 || sampleRows.length === 0) {
+    return candidates[0]!;
+  }
+  const limit = Math.min(sampleRows.length, 500);
+  const scoreOf = (meta: ColumnMeta): number => {
+    let score = 0;
+    for (let i = 0; i < limit; i++) {
+      const raw = sampleRows[i]![meta.key];
+      if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+        score += 3;
+        continue;
+      }
+      if (typeof raw === "string" && tryParseDate(raw) != null) {
+        score += 2;
+      }
+    }
+    return score;
+  };
+  let best = candidates[0]!;
+  let bestScore = scoreOf(best);
+  for (let i = 1; i < candidates.length; i++) {
+    const c = candidates[i]!;
+    const s = scoreOf(c);
+    if (s > bestScore) {
+      bestScore = s;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/** Дата создания сделки для боковой сводки: те же подписи, что и в dealCreatedDateColumn; при дубликатах — лучшая по данным. */
+export function dealCreatedDateColumnForKpi(
+  columns: ColumnMeta[],
+  sampleRows: Record<string, unknown>[] = [],
+): ColumnMeta | null {
+  const candidates = columnsMatchingExactHeaderList(
+    columns,
+    DEAL_CREATED_DATE_EXACT_HEADERS,
+  );
+  return pickCreatedDateColumnBySample(candidates, sampleRows);
+}
+
+/** Дата создания компании для боковой сводки: те же правила, что и dealCreatedDateColumnForKpi (список заголовков — COMPANY_*). */
+export function companyCreatedDateColumnForKpi(
+  columns: ColumnMeta[],
+  sampleRows: Record<string, unknown>[] = [],
+): ColumnMeta | null {
+  const candidates = columnsMatchingExactHeaderList(
+    columns,
+    COMPANY_CREATED_DATE_EXACT_HEADERS,
+  );
+  return pickCreatedDateColumnBySample(candidates, sampleRows);
+}
+
+/** Дата создания сделки: как companyCreatedDateColumn — только точные подписи колонок (тип date, затем string). */
+export function dealCreatedDateColumn(columns: ColumnMeta[]): ColumnMeta | null {
+  const headers = [...DEAL_CREATED_DATE_EXACT_HEADERS];
   return (
-    pickColumn(columns, {
+    pickStrictHeaderColumn(columns, {
       types: ["date"],
-      preferHeaders: [
-        "дата закрытия",
-        "дата завершения",
-        "дата успешного закрытия",
-        "дата изменения",
-        "дата создания",
-      ],
-      anyHeader: ["закрыт", "заверш"],
+      exactHeaders: headers,
     }) ??
-    pickColumn(columns, {
+    pickStrictHeaderColumn(columns, {
       types: ["string"],
-      anyHeader: [
-        "дата закрытия",
-        "дата завершения",
-        "дата изменения сделки",
-      ],
+      exactHeaders: headers,
+    })
+  );
+}
+
+/** Дата закрытия / завершения сделки для динамики выручки и т.п. — только явные поля, без «любой даты». */
+const DEAL_CLOSED_DATE_EXACT_HEADERS: readonly string[] = [
+  "дата закрытия",
+  "дата завершения",
+  "дата успешного закрытия",
+  "дата изменения сделки",
+  "дата изменения",
+  "closed date",
+  "closed_at",
+  "date closed",
+  "close date",
+];
+
+export function dealClosedDateColumn(columns: ColumnMeta[]): ColumnMeta | null {
+  const headers = [...DEAL_CLOSED_DATE_EXACT_HEADERS];
+  return (
+    pickStrictHeaderColumn(columns, {
+      types: ["date"],
+      exactHeaders: headers,
     }) ??
-    dateLikeColumn(columns)
+    pickStrictHeaderColumn(columns, {
+      types: ["string"],
+      exactHeaders: headers,
+    })
+  );
+}
+
+/**
+ * Дата закрытия для KPI цикла сделки: только фактическое/финальное закрытие,
+ * без «дата изменения», чтобы не завышать длительность цикла.
+ */
+const DEAL_CYCLE_CLOSED_DATE_EXACT_HEADERS: readonly string[] = [
+  "дата закрытия, факт",
+  "дата закрытия",
+  "дата завершения",
+  "дата успешного закрытия",
+  "closed date",
+  "closed_at",
+  "date closed",
+  "close date",
+];
+
+export function dealCycleClosedDateColumn(
+  columns: ColumnMeta[],
+): ColumnMeta | null {
+  const headers = [...DEAL_CYCLE_CLOSED_DATE_EXACT_HEADERS];
+  return (
+    pickStrictHeaderColumn(columns, {
+      types: ["date"],
+      exactHeaders: headers,
+    }) ??
+    pickStrictHeaderColumn(columns, {
+      types: ["string"],
+      exactHeaders: headers,
+    })
+  );
+}
+
+/**
+ * Дата отправки КП по сделке (типичное поле Битрикс24).
+ * Сужаем по подписи, чтобы не перепутать с другими датами.
+ */
+export function dealKpSentDateColumn(columns: ColumnMeta[]): ColumnMeta | null {
+  const strictDate = pickStrictHeaderColumn(columns, {
+    types: ["date"],
+    exactHeaders: [
+      "Дата отправки КП",
+      "дата отправки кп",
+      "Дата отправки коммерческого предложения",
+      "дата отправки коммерческого предложения",
+    ],
+  });
+  if (strictDate) {
+    return strictDate;
+  }
+  const strictStr = pickStrictHeaderColumn(columns, {
+    types: ["string"],
+    exactHeaders: [
+      "Дата отправки КП",
+      "дата отправки кп",
+      "Дата отправки коммерческого предложения",
+      "дата отправки коммерческого предложения",
+    ],
+  });
+  if (strictStr) {
+    return strictStr;
+  }
+  const pool = columns.filter(
+    (c) =>
+      c.inferredType === "date" ||
+      c.inferredType === "string" ||
+      c.inferredType === "unknown",
+  );
+  return (
+    pool.find((c) => {
+      const h = normHeader(c.header);
+      const k = normHeader(c.key);
+      const t = `${h} ${k}`;
+      return (
+        t.includes("отправк") &&
+        (t.includes("кп") ||
+          t.includes("коммерч") ||
+          t.includes("предложен"))
+      );
+    }) ?? null
   );
 }
 
@@ -817,6 +1105,43 @@ function barAvg(x: ColumnMeta, y: ColumnMeta): ChartConfig {
   };
 }
 
+/** Две метрики: среднее по полю КП и средний чек сделки на стадии «Отправка КП». */
+function barLiteralAvgKpVsDealAtSendStage(
+  stage: ColumnMeta,
+  kpAmount: ColumnMeta,
+  dealAmount: ColumnMeta,
+): ChartConfig {
+  const sameColumn = kpAmount.key === dealAmount.key;
+  const yKeys = sameColumn ? [dealAmount.key] : [kpAmount.key, dealAmount.key];
+  return {
+    xKey: stage.key,
+    yKeys,
+    chartType: "bar",
+    aggregation: "avg",
+    filters: [],
+    literalAvgBars: [
+      {
+        label: "Средняя стоимость КП",
+        filters: [{ columnKey: kpAmount.key, min: 0.01 }],
+        valueKey: kpAmount.key,
+        seriesKey: sameColumn ? dealAmount.key : kpAmount.key,
+      },
+      {
+        label: "Средний чек (стадия «Отправка КП»)",
+        filters: [
+          {
+            columnKey: stage.key,
+            valuesContainAll: ["отправка"],
+            valuesContainAny: ["кп", "kp"],
+          },
+        ],
+        valueKey: dealAmount.key,
+        seriesKey: dealAmount.key,
+      },
+    ],
+  };
+}
+
 function barCountNonempty(x: ColumnMeta, y: ColumnMeta): ChartConfig {
   return {
     xKey: x.key,
@@ -848,22 +1173,44 @@ function pieCount(x: ColumnMeta, y: ColumnMeta): ChartConfig {
   };
 }
 
+/** Доля повторных и неповторных сделок по колонке типа / признаку повторности. */
+function pieDealRepeatVsNew(x: ColumnMeta, y: ColumnMeta): ChartConfig {
+  return {
+    xKey: x.key,
+    yKeys: [y.key],
+    chartType: "pie",
+    aggregation: "count",
+    filters: [],
+    literalPieComplement: {
+      repeatLabel: "Повторные",
+      nonRepeatLabel: "Неповторные",
+      repeatMatchAny: [
+        { columnKey: x.key, valuesContainAny: ["повтор", "repeat"] },
+        {
+          columnKey: x.key,
+          values: [
+            "Да",
+            "да",
+            "Yes",
+            "yes",
+            "Y",
+            "y",
+            "1",
+            "true",
+            "True",
+          ],
+        },
+      ],
+    },
+  };
+}
+
 function areaSum(x: ColumnMeta, y: ColumnMeta): ChartConfig {
   return {
     xKey: x.key,
     yKeys: [y.key],
     chartType: "area",
     aggregation: "sum",
-    filters: [],
-  };
-}
-
-function areaCount(x: ColumnMeta, y: ColumnMeta): ChartConfig {
-  return {
-    xKey: x.key,
-    yKeys: [y.key],
-    chartType: "area",
-    aggregation: "count",
     filters: [],
   };
 }
@@ -890,6 +1237,17 @@ function lineCountByMonth(x: ColumnMeta, y: ColumnMeta): ChartConfig {
   };
 }
 
+function lineSumByMonth(x: ColumnMeta, y: ColumnMeta): ChartConfig {
+  return {
+    xKey: x.key,
+    yKeys: [y.key],
+    chartType: "line",
+    aggregation: "sum",
+    filters: [],
+    dateGranularity: "month",
+  };
+}
+
 /** Нарастающий итог числа строк по месяцам (кривая монотонно растёт). */
 function areaCumulativeCountByMonth(x: ColumnMeta, y: ColumnMeta): ChartConfig {
   return {
@@ -904,27 +1262,46 @@ function areaCumulativeCountByMonth(x: ColumnMeta, y: ColumnMeta): ChartConfig {
 }
 
 
-function barSumWon(x: ColumnMeta, y: ColumnMeta, stage: ColumnMeta): ChartConfig {
+/** Сумма и число выигранных сделок по менеджеру в одном столбчатом графике (две оси Y). */
+function barSumAndCountWon(
+  x: ColumnMeta,
+  y: ColumnMeta,
+  stage: ColumnMeta,
+): ChartConfig {
   return {
     xKey: x.key,
-    yKeys: [y.key],
+    yKeys: [`${y.key}__won_sum`, `${y.key}__won_cnt`],
+    ySourceKeys: [y.key, y.key],
+    yAggregations: ["sum", "count"],
     chartType: "bar",
     aggregation: "sum",
     filters: wonDealStageFilters(stage.key),
   };
 }
 
-function barCountWon(x: ColumnMeta, y: ColumnMeta, stage: ColumnMeta): ChartConfig {
+function barCountOpen(x: ColumnMeta, y: ColumnMeta, stage: ColumnMeta): ChartConfig {
   return {
     xKey: x.key,
     yKeys: [y.key],
     chartType: "bar",
     aggregation: "count",
+    filters: openDealStageFilters(stage.key),
+  };
+}
+
+/** Выручка (успешные сделки): сумма по календарным дням даты закрытия. */
+function lineSumWon(x: ColumnMeta, y: ColumnMeta, stage: ColumnMeta): ChartConfig {
+  return {
+    xKey: x.key,
+    yKeys: [y.key],
+    chartType: "line",
+    aggregation: "sum",
     filters: wonDealStageFilters(stage.key),
   };
 }
 
-function lineSumByMonthWon(
+/** Средняя сумма успешных сделок по календарным месяцам даты закрытия. */
+function lineAvgByMonthWon(
   x: ColumnMeta,
   y: ColumnMeta,
   stage: ColumnMeta,
@@ -933,7 +1310,7 @@ function lineSumByMonthWon(
     xKey: x.key,
     yKeys: [y.key],
     chartType: "line",
-    aggregation: "sum",
+    aggregation: "avg",
     filters: wonDealStageFilters(stage.key),
     dateGranularity: "month",
   };
@@ -954,121 +1331,16 @@ function lineCountByMonthWon(
   };
 }
 
-function areaSumByMonthWon(
-  x: ColumnMeta,
-  y: ColumnMeta,
-  stage: ColumnMeta,
-): ChartConfig {
-  return {
-    xKey: x.key,
-    yKeys: [y.key],
-    chartType: "area",
-    aggregation: "sum",
-    filters: wonDealStageFilters(stage.key),
-    dateGranularity: "month",
-  };
-}
-
 function pieSumWon(x: ColumnMeta, y: ColumnMeta, stage: ColumnMeta): ChartConfig {
   return {
     xKey: x.key,
     yKeys: [y.key],
     chartType: "pie",
     aggregation: "sum",
-    filters: wonDealStageFilters(stage.key),
-  };
-}
-
-function barSumWonQ1_2026(
-  x: ColumnMeta,
-  y: ColumnMeta,
-  stage: ColumnMeta,
-  dateCol: ColumnMeta,
-): ChartConfig {
-  return {
-    xKey: x.key,
-    yKeys: [y.key],
-    chartType: "bar",
-    aggregation: "sum",
-    filters: wonDealQ1_2026Filters(stage, dateCol),
-  };
-}
-
-function barCountWonQ1_2026(
-  x: ColumnMeta,
-  y: ColumnMeta,
-  stage: ColumnMeta,
-  dateCol: ColumnMeta,
-): ChartConfig {
-  return {
-    xKey: x.key,
-    yKeys: [y.key],
-    chartType: "bar",
-    aggregation: "count",
-    filters: wonDealQ1_2026Filters(stage, dateCol),
-  };
-}
-
-function lineSumByMonthWonQ1_2026(
-  x: ColumnMeta,
-  y: ColumnMeta,
-  stage: ColumnMeta,
-  dateCol: ColumnMeta,
-): ChartConfig {
-  return {
-    xKey: x.key,
-    yKeys: [y.key],
-    chartType: "line",
-    aggregation: "sum",
-    filters: wonDealQ1_2026Filters(stage, dateCol),
-    dateGranularity: "month",
-  };
-}
-
-function lineCountByMonthWonQ1_2026(
-  x: ColumnMeta,
-  y: ColumnMeta,
-  stage: ColumnMeta,
-  dateCol: ColumnMeta,
-): ChartConfig {
-  return {
-    xKey: x.key,
-    yKeys: [y.key],
-    chartType: "line",
-    aggregation: "count",
-    filters: wonDealQ1_2026Filters(stage, dateCol),
-    dateGranularity: "month",
-  };
-}
-
-function areaSumByMonthWonQ1_2026(
-  x: ColumnMeta,
-  y: ColumnMeta,
-  stage: ColumnMeta,
-  dateCol: ColumnMeta,
-): ChartConfig {
-  return {
-    xKey: x.key,
-    yKeys: [y.key],
-    chartType: "area",
-    aggregation: "sum",
-    filters: wonDealQ1_2026Filters(stage, dateCol),
-    dateGranularity: "month",
-  };
-}
-
-function pieSumWonQ1_2026(
-  x: ColumnMeta,
-  y: ColumnMeta,
-  stage: ColumnMeta,
-  dateCol: ColumnMeta,
-): ChartConfig {
-  return {
-    xKey: x.key,
-    yKeys: [y.key],
-    chartType: "pie",
-    aggregation: "sum",
-    filters: wonDealQ1_2026Filters(stage, dateCol),
+    filters: [
+      ...wonDealStageFilters(stage.key),
+      { columnKey: x.key, excludeValues: ["(пусто)"] },
+    ],
   };
 }
 
@@ -1271,24 +1543,6 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
     },
   },
   {
-    id: "leads_area_sum_by_date",
-    entity: "leads",
-    title: "Динамика суммы (область)",
-    description:
-      "Та же динамика суммы по датам, что и линия, но с мягкой заливкой под кривой — удобно для презентаций.",
-    resolve(columns) {
-      const x = dateLikeColumn(columns);
-      const y = leadValueColumn(columns);
-      if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет числовой колонки для суммы." };
-      }
-      return { ok: true, config: areaSum(x, y) };
-    },
-  },
-  {
     id: "leads_line_avg_value_by_date",
     entity: "leads",
     title: "Средняя сумма лида по дням",
@@ -1373,24 +1627,6 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
         return { ok: false, error: "Нет колонок в данных." };
       }
       return { ok: true, config: lineCount(x, y) };
-    },
-  },
-  {
-    id: "leads_area_inflow_by_date",
-    entity: "leads",
-    title: "Приток лидов по датам (область)",
-    description:
-      "Количество новых лидов по дням с заливкой — наглядный «объём» входящего потока.",
-    resolve(columns) {
-      const x = dateLikeColumn(columns);
-      const y = firstNumberColumn(columns) ?? columns[0] ?? null;
-      if (!x) {
-        return { ok: false, error: "Нет колонки с датой создания / изменения." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет колонок в данных." };
-      }
-      return { ok: true, config: areaCount(x, y) };
     },
   },
   {
@@ -1612,35 +1848,22 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
     id: "deals_sum_by_date",
     entity: "deals",
     title: "Сумма сделок по датам",
-    description: "Динамика суммы по дате создания / закрытия.",
+    description:
+      "Ось X — дата создания сделки (как в выгрузке Битрикс24: только явные поля «Дата создания», «Дата создания сделки» и т.д., без угадывания «любой даты»). По умолчанию ось — календарные дни; переключатель «Период» задаёт день, месяц, квартал или год. Значение в точке — сумма числовой колонки сделки по строкам, попавшим в интервал.",
     resolve(columns) {
-      const x = dateLikeColumn(columns);
+      const x = dealCreatedDateColumn(columns);
       const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
       if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
+        return {
+          ok: false,
+          error:
+            "Нет колонки с датой создания сделки (нужна явная подпись в выгрузке).",
+        };
       }
       if (!y) {
         return { ok: false, error: "Нет числовой колонки для суммы." };
       }
       return { ok: true, config: lineSum(x, y) };
-    },
-  },
-  {
-    id: "deals_area_sum_by_date",
-    entity: "deals",
-    title: "Динамика суммы сделок (область)",
-    description:
-      "Сумма сделок по датам подчёркнута площадью под линией — удобно для отчётов и слайдов.",
-    resolve(columns) {
-      const x = dateLikeColumn(columns);
-      const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
-      if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет числовой колонки для суммы." };
-      }
-      return { ok: true, config: areaSum(x, y) };
     },
   },
   {
@@ -1661,11 +1884,11 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
     },
   },
   {
-    id: "deals_won_sum_by_responsible",
+    id: "deals_won_sum_and_count_by_responsible",
     entity: "deals",
-    title: "Выигранные сделки: сумма по менеджерам",
+    title: "Топ менеджеров по успешным сделкам (сумма и количество)",
     description:
-      "Только успешные сделки (фильтр по типичным названиям стадии «Успешно реализована» и др.). Сумма по ответственным.",
+      "В выборку попадают только строки со стадией успеха (типовые подписи CRM). По горизонтали — ответственный. Два столбца на менеджера: сумма поля суммы в рублях (левая ось) и число таких сделок (правая ось). Шкалы разные, значения не складываются.",
     resolve(columns) {
       const stage = stageColumnDeals(columns);
       const x = responsibleColumn(columns);
@@ -1679,15 +1902,15 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
       if (!y) {
         return { ok: false, error: "Нет числовой колонки суммы сделки." };
       }
-      return { ok: true, config: barSumWon(x, y, stage) };
+      return { ok: true, config: barSumAndCountWon(x, y, stage) };
     },
   },
   {
-    id: "deals_won_count_by_responsible",
+    id: "deals_top_managers_in_progress_count",
     entity: "deals",
-    title: "Выигранные сделки: количество по менеджерам",
+    title: "Топ менеджеров: сделки в работе (количество)",
     description:
-      "Число выигранных сделок по каждому ответственному (по тем же названиям успешной стадии).",
+      "Сколько активных сделок у каждого менеджера (без финальных стадий успех и провал).",
     resolve(columns) {
       const stage = stageColumnDeals(columns);
       const x = responsibleColumn(columns);
@@ -1701,29 +1924,7 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
       if (!y) {
         return { ok: false, error: "Нет колонок в данных." };
       }
-      return { ok: true, config: barCountWon(x, y, stage) };
-    },
-  },
-  {
-    id: "deals_won_sum_by_month",
-    entity: "deals",
-    title: "Выигранные сделки: сумма по месяцам",
-    description:
-      "Динамика суммы выигранных сделок по календарным месяцам (дата в выгрузке — закрытия, изменения или создания).",
-    resolve(columns) {
-      const stage = stageColumnDeals(columns);
-      const x = dealClosedDateColumn(columns);
-      const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
-      if (!stage) {
-        return { ok: false, error: "Нет колонки стадии / статуса сделки." };
-      }
-      if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет числовой колонки суммы." };
-      }
-      return { ok: true, config: lineSumByMonthWon(x, y, stage) };
+      return { ok: true, config: barCountOpen(x, y, stage) };
     },
   },
   {
@@ -1731,10 +1932,10 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
     entity: "deals",
     title: "Выигранные сделки: количество по месяцам",
     description:
-      "Сколько выигранных сделок закрыто в каждом месяце — тренд «скорости побед».",
+      "Сколько сделок на стадии «Сделка успешна» создано в каждом месяце.",
     resolve(columns) {
       const stage = stageColumnDeals(columns);
-      const x = dealClosedDateColumn(columns);
+      const x = dealCreatedDateColumn(columns);
       const y = firstNumberColumn(columns) ?? columns[0] ?? null;
       if (!stage) {
         return { ok: false, error: "Нет колонки стадии / статуса сделки." };
@@ -1745,18 +1946,25 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
       if (!y) {
         return { ok: false, error: "Нет колонок в данных." };
       }
-      return { ok: true, config: lineCountByMonthWon(x, y, stage) };
+      const cfg = lineCountByMonthWon(x, y, stage);
+      return {
+        ok: true,
+        config: {
+          ...cfg,
+          filters: [{ columnKey: stage.key, values: ["Сделка успешна"] }],
+        },
+      };
     },
   },
   {
-    id: "deals_won_area_sum_by_month",
+    id: "deals_revenue_dynamics",
     entity: "deals",
-    title: "Выигранные сделки: сумма по месяцам (область)",
+    title: "Динамика выручки",
     description:
-      "То же, что сумма по месяцам для выигранных сделок, с заливкой под кривой.",
+      "Сумма успешно закрытых сделок по фактической дате закрытия, только стадии «успех». По умолчанию ось — календарные дни; переключатель «Период» задаёт месяц, квартал или год.",
     resolve(columns) {
       const stage = stageColumnDeals(columns);
-      const x = dealClosedDateColumn(columns);
+      const x = dealCycleClosedDateColumn(columns);
       const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
       if (!stage) {
         return { ok: false, error: "Нет колонки стадии / статуса сделки." };
@@ -1767,7 +1975,29 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
       if (!y) {
         return { ok: false, error: "Нет числовой колонки суммы." };
       }
-      return { ok: true, config: areaSumByMonthWon(x, y, stage) };
+      return { ok: true, config: lineSumWon(x, y, stage) };
+    },
+  },
+  {
+    id: "deals_avg_deal_dynamics",
+    entity: "deals",
+    title: "Динамика средней сделки",
+    description:
+      "Средняя сумма по успешно закрытым сделкам в каждом месяце (дата закрытия из выгрузки; только стадии «успех»).",
+    resolve(columns) {
+      const stage = stageColumnDeals(columns);
+      const x = dealCycleClosedDateColumn(columns);
+      const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
+      if (!stage) {
+        return { ok: false, error: "Нет колонки стадии / статуса сделки." };
+      }
+      if (!x) {
+        return { ok: false, error: "Нет колонки с датой." };
+      }
+      if (!y) {
+        return { ok: false, error: "Нет числовой колонки суммы." };
+      }
+      return { ok: true, config: lineAvgByMonthWon(x, y, stage) };
     },
   },
   {
@@ -1793,168 +2023,6 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
     },
   },
   {
-    id: "deals_won_q1_2026_sum_by_responsible",
-    entity: "deals",
-    title: "Выигранные, 1 кв. 2026: сумма по менеджерам",
-    description:
-      "Как обычные выигранные сделки по менеджерам, но только за период 01.01.2026–31.03.2026 по выбранной колонке даты (закрытие / изменение / создание).",
-    resolve(columns) {
-      const stage = stageColumnDeals(columns);
-      const dateCol = dealClosedDateColumn(columns);
-      const x = responsibleColumn(columns);
-      const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
-      if (!stage) {
-        return { ok: false, error: "Нет колонки стадии / статуса сделки." };
-      }
-      if (!dateCol) {
-        return { ok: false, error: "Нет колонки с датой." };
-      }
-      if (!x) {
-        return { ok: false, error: "Нет колонки «Ответственный»." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет числовой колонки суммы сделки." };
-      }
-      return {
-        ok: true,
-        config: barSumWonQ1_2026(x, y, stage, dateCol),
-      };
-    },
-  },
-  {
-    id: "deals_won_q1_2026_count_by_responsible",
-    entity: "deals",
-    title: "Выигранные, 1 кв. 2026: количество по менеджерам",
-    description:
-      "Число выигранных сделок по ответственным только за 1 кв. 2026 (фильтр по дате + успешная стадия).",
-    resolve(columns) {
-      const stage = stageColumnDeals(columns);
-      const dateCol = dealClosedDateColumn(columns);
-      const x = responsibleColumn(columns);
-      const y = firstNumberColumn(columns) ?? columns[0] ?? null;
-      if (!stage) {
-        return { ok: false, error: "Нет колонки стадии / статуса сделки." };
-      }
-      if (!dateCol) {
-        return { ok: false, error: "Нет колонки с датой." };
-      }
-      if (!x) {
-        return { ok: false, error: "Нет колонки «Ответственный»." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет колонок в данных." };
-      }
-      return {
-        ok: true,
-        config: barCountWonQ1_2026(x, y, stage, dateCol),
-      };
-    },
-  },
-  {
-    id: "deals_won_q1_2026_sum_by_month",
-    entity: "deals",
-    title: "Выигранные, 1 кв. 2026: сумма по месяцам",
-    description:
-      "Янв.–мар. 2026: динамика суммы выигранных сделок по месяцам (точки не выйдут за квартал благодаря фильтру даты).",
-    resolve(columns) {
-      const stage = stageColumnDeals(columns);
-      const x = dealClosedDateColumn(columns);
-      const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
-      if (!stage) {
-        return { ok: false, error: "Нет колонки стадии / статуса сделки." };
-      }
-      if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет числовой колонки суммы." };
-      }
-      return {
-        ok: true,
-        config: lineSumByMonthWonQ1_2026(x, y, stage, x),
-      };
-    },
-  },
-  {
-    id: "deals_won_q1_2026_count_by_month",
-    entity: "deals",
-    title: "Выигранные, 1 кв. 2026: количество по месяцам",
-    description:
-      "Сколько выигранных сделок в каждом месяце 1 кв. 2026 — обычно три столбика/точки: янв., февр., март.",
-    resolve(columns) {
-      const stage = stageColumnDeals(columns);
-      const x = dealClosedDateColumn(columns);
-      const y = firstNumberColumn(columns) ?? columns[0] ?? null;
-      if (!stage) {
-        return { ok: false, error: "Нет колонки стадии / статуса сделки." };
-      }
-      if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет колонок в данных." };
-      }
-      return {
-        ok: true,
-        config: lineCountByMonthWonQ1_2026(x, y, stage, x),
-      };
-    },
-  },
-  {
-    id: "deals_won_q1_2026_area_sum_by_month",
-    entity: "deals",
-    title: "Выигранные, 1 кв. 2026: сумма по месяцам (область)",
-    description:
-      "Сумма выигранных по месяцам в 1 кв. 2026 с заливкой под линией.",
-    resolve(columns) {
-      const stage = stageColumnDeals(columns);
-      const x = dealClosedDateColumn(columns);
-      const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
-      if (!stage) {
-        return { ok: false, error: "Нет колонки стадии / статуса сделки." };
-      }
-      if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет числовой колонки суммы." };
-      }
-      return {
-        ok: true,
-        config: areaSumByMonthWonQ1_2026(x, y, stage, x),
-      };
-    },
-  },
-  {
-    id: "deals_won_q1_2026_pie_by_company",
-    entity: "deals",
-    title: "Выигранные, 1 кв. 2026: доли суммы по компаниям",
-    description:
-      "Круговая диаграмма по клиентам только для выигранных сделок и только за 01.01.2026–31.03.2026.",
-    resolve(columns) {
-      const stage = stageColumnDeals(columns);
-      const dateCol = dealClosedDateColumn(columns);
-      const x = companyColumn(columns);
-      const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
-      if (!stage) {
-        return { ok: false, error: "Нет колонки стадии / статуса сделки." };
-      }
-      if (!dateCol) {
-        return { ok: false, error: "Нет колонки с датой." };
-      }
-      if (!x) {
-        return { ok: false, error: "Нет колонки компании в сделках." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет числовой колонки суммы." };
-      }
-      return {
-        ok: true,
-        config: pieSumWonQ1_2026(x, y, stage, dateCol),
-      };
-    },
-  },
-  {
     id: "deals_sum_by_responsible",
     entity: "deals",
     title: "Сумма по ответственным",
@@ -1969,23 +2037,6 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
         return { ok: false, error: "Нет числовой колонки для суммы." };
       }
       return { ok: true, config: barSum(x, y) };
-    },
-  },
-  {
-    id: "deals_count_by_company",
-    entity: "deals",
-    title: "Количество сделок по компаниям",
-    description: "Сколько сделок у каждой компании.",
-    resolve(columns) {
-      const x = companyColumn(columns);
-      const y = firstNumberColumn(columns) ?? columns[0] ?? null;
-      if (!x) {
-        return { ok: false, error: "Нет колонки компании в сделках." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет колонок в данных." };
-      }
-      return { ok: true, config: barCount(x, y) };
     },
   },
   {
@@ -2007,33 +2058,20 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
     },
   },
   {
-    id: "deals_sum_by_company",
-    entity: "deals",
-    title: "Сумма сделок по компаниям",
-    description: "Совокупная сумма сделок по каждой компании-контрагенту.",
-    resolve(columns) {
-      const x = companyColumn(columns);
-      const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
-      if (!x) {
-        return { ok: false, error: "Нет колонки компании в сделке." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет числовой колонки суммы сделки." };
-      }
-      return { ok: true, config: barSum(x, y) };
-    },
-  },
-  {
     id: "deals_count_by_created_date",
     entity: "deals",
     title: "Приток сделок по датам",
     description:
-      "Число созданных сделок по дням (по дате из выгрузки: создания или изменения).",
+      "Число сделок по дням по колонке даты создания сделки (явное поле в выгрузке, как для компаний по дате создания).",
     resolve(columns) {
-      const x = dateLikeColumn(columns);
+      const x = dealCreatedDateColumn(columns);
       const y = firstNumberColumn(columns) ?? columns[0] ?? null;
       if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
+        return {
+          ok: false,
+          error:
+            "Нет колонки с датой создания сделки (нужна явная подпись в выгрузке).",
+        };
       }
       if (!y) {
         return { ok: false, error: "Нет колонок в данных." };
@@ -2042,39 +2080,104 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
     },
   },
   {
-    id: "deals_area_inflow_by_date",
+    id: "deals_cumulative_count_by_month_area",
     entity: "deals",
-    title: "Приток сделок по датам (область)",
+    title: "Нарастающий итог сделок по месяцам",
     description:
-      "Число созданных сделок по дням с заливкой — насколько ровный или «пульсирующий» поток.",
+      "Кумулятивная кривая: общее число сделок с накоплением от первого к последнему месяцу по дате создания (ось X — месяцы; в Excel блок «по месяцам» — столбцы и оформление как у компаний).",
     resolve(columns) {
-      const x = dateLikeColumn(columns);
+      const x = dealCreatedDateColumn(columns);
       const y = firstNumberColumn(columns) ?? columns[0] ?? null;
       if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
+        return {
+          ok: false,
+          error:
+            "Нет колонки с датой создания сделки (нужна явная подпись в выгрузке).",
+        };
       }
       if (!y) {
         return { ok: false, error: "Нет колонок в данных." };
       }
-      return { ok: true, config: areaCount(x, y) };
+      return { ok: true, config: areaCumulativeCountByMonth(x, y) };
     },
   },
   {
-    id: "deals_avg_amount_by_stage",
+    id: "deals_kp_sent_count_by_period",
     entity: "deals",
-    title: "Средний чек по стадиям",
+    title: "Отправки КП: количество по периодам",
     description:
-      "Средняя сумма сделки в разрезе стадии — удобно сравнивать этапы воронки.",
+      "Число сделок по дате отправки КП (пустые даты исключены). По умолчанию — месяцы; переключатель «Период» задаёт день, квартал или год — в том числе дневную динамику вместо отдельного графика «по дням».",
     resolve(columns) {
-      const x = stageColumnDeals(columns);
-      const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
+      const x = dealKpSentDateColumn(columns);
+      const y = firstNumberColumn(columns) ?? columns[0] ?? null;
       if (!x) {
-        return { ok: false, error: "Нет колонки стадии сделки." };
+        return {
+          ok: false,
+          error: "Нет колонки «Дата отправки КП» (или схожей по подписи).",
+        };
       }
       if (!y) {
-        return { ok: false, error: "Нет числовой колонки суммы." };
+        return { ok: false, error: "Нет колонок в данных." };
       }
-      return { ok: true, config: barAvg(x, y) };
+      return {
+        ok: true,
+        config: {
+          ...lineCountByMonth(x, y),
+          filters: [{ columnKey: x.key, excludeValues: ["(пусто)"] }],
+        },
+      };
+    },
+  },
+  {
+    id: "deals_kp_sent_sum_by_period",
+    entity: "deals",
+    title: "Отправки КП: сумма сделок по периодам",
+    description:
+      "Сумма сделки по дате отправки КП (пустые даты исключены). По умолчанию — месяцы; переключатель «Период» — день, квартал или год.",
+    resolve(columns) {
+      const x = dealKpSentDateColumn(columns);
+      const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
+      if (!x) {
+        return {
+          ok: false,
+          error: "Нет колонки «Дата отправки КП» (или схожей по подписи).",
+        };
+      }
+      if (!y) {
+        return { ok: false, error: "Нет числовой колонки суммы сделки." };
+      }
+      return {
+        ok: true,
+        config: {
+          ...lineSumByMonth(x, y),
+          filters: [{ columnKey: x.key, excludeValues: ["(пусто)"] }],
+        },
+      };
+    },
+  },
+  {
+    id: "deals_kp_avg_and_check_at_send_stage",
+    entity: "deals",
+    title: "Средняя стоимость КП и средний чек на «Отправке КП»",
+    description:
+      "Среднее по полю стоимости/суммы КП в выгрузке и средняя сумма сделки по строкам, где стадия содержит «отправка» и «кп»/«kp» (в т.ч. «7. Отправка КП» и другие подписи из CRM). Если отдельного поля КП нет, для первого показателя используется сумма сделки.",
+    resolve(columns) {
+      const stage = stageColumnDeals(columns);
+      const deal = amountLikeColumn(columns) ?? firstNumberColumn(columns);
+      const kp = dealKpAmountColumn(columns) ?? deal;
+      if (!stage) {
+        return { ok: false, error: "Нет колонки стадии сделки." };
+      }
+      if (!deal) {
+        return { ok: false, error: "Нет числовой колонки суммы сделки." };
+      }
+      if (!kp) {
+        return { ok: false, error: "Нет числовой колонки для расчета средних." };
+      }
+      return {
+        ok: true,
+        config: barLiteralAvgKpVsDealAtSendStage(stage, kp, deal),
+      };
     },
   },
   {
@@ -2178,12 +2281,16 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
     entity: "deals",
     title: "Средний чек по дням",
     description:
-      "Как меняется средняя сумма сделки по датам в выгрузке — заметны ли провалы и всплески.",
+      "Средняя сумма сделки по календарным интервалам; ось X — дата создания сделки (явная колонка выгрузки).",
     resolve(columns) {
-      const x = dateLikeColumn(columns);
+      const x = dealCreatedDateColumn(columns);
       const y = amountLikeColumn(columns) ?? firstNumberColumn(columns);
       if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
+        return {
+          ok: false,
+          error:
+            "Нет колонки с датой создания сделки (нужна явная подпись в выгрузке).",
+        };
       }
       if (!y) {
         return { ok: false, error: "Нет числовой колонки суммы." };
@@ -2217,7 +2324,7 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
     entity: "deals",
     title: "Сделки по типу (новая / повторная)",
     description:
-      "Сколько сделок каждого типа, если в выгрузке есть соответствующее поле.",
+      "Круговая диаграмма: доля повторных и неповторных сделок по полю типа или признаку «повторная» (типичные подписи и значения Да/Нет в выгрузке).",
     resolve(columns) {
       const x = dealBusinessTypeColumn(columns);
       const y = firstNumberColumn(columns) ?? columns[0] ?? null;
@@ -2230,7 +2337,7 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
       if (!y) {
         return { ok: false, error: "Нет колонок в данных." };
       }
-      return { ok: true, config: barCount(x, y) };
+      return { ok: true, config: pieDealRepeatVsNew(x, y) };
     },
   },
 
@@ -2328,24 +2435,6 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
         return { ok: false, error: "Нет колонок в данных." };
       }
       return { ok: true, config: lineCount(x, y) };
-    },
-  },
-  {
-    id: "contacts_area_count_by_created_date",
-    entity: "contacts",
-    title: "Приток контактов (область)",
-    description:
-      "Новые контакты по датам с заливкой — визуальный объём роста базы.",
-    resolve(columns) {
-      const x = dateLikeColumn(columns);
-      const y = firstNumberColumn(columns) ?? columns[0] ?? null;
-      if (!x) {
-        return { ok: false, error: "Нет колонки с датой." };
-      }
-      if (!y) {
-        return { ok: false, error: "Нет колонок в данных." };
-      }
-      return { ok: true, config: areaCount(x, y) };
     },
   },
   {
@@ -3155,6 +3244,122 @@ export const PREDEFINED_CHARTS: PredefinedChartSpec[] = [
       };
     },
   },
+
+  // —— Универсальные (любая таблица Excel) ——
+  {
+    id: "generic_bar_sum_by_category",
+    entity: "generic",
+    title: "Сумма по первой текстовой колонке",
+    description:
+      "Столбцы: первая подходящая колонка с текстом (категория) и первая числовая — сумма по категориям.",
+    resolve(columns) {
+      const x = firstCategoryColumnGeneric(columns);
+      const y = firstNumberColumn(columns);
+      if (!x) {
+        return {
+          ok: false,
+          error: "Нет текстовой колонки для группировки (кроме похожих на ID).",
+        };
+      }
+      if (!y) {
+        return { ok: false, error: "Нет числовой колонки для суммы." };
+      }
+      if (x.key === y.key) {
+        return { ok: false, error: "Нужны две разные колонки." };
+      }
+      return { ok: true, config: barSum(x, y) };
+    },
+  },
+  {
+    id: "generic_bar_count_by_category",
+    entity: "generic",
+    title: "Количество по первой текстовой колонке",
+    description:
+      "Сколько строк в каждой категории по первой текстовой колонке.",
+    resolve(columns) {
+      const x = firstCategoryColumnGeneric(columns);
+      const y = firstNumberColumn(columns) ?? columns[0] ?? null;
+      if (!x) {
+        return {
+          ok: false,
+          error: "Нет текстовой колонки для группировки.",
+        };
+      }
+      if (!y) {
+        return { ok: false, error: "Нет колонок в данных." };
+      }
+      if (x.key === y.key) {
+        return { ok: false, error: "Нужны две разные колонки." };
+      }
+      return { ok: true, config: barCount(x, y) };
+    },
+  },
+  {
+    id: "generic_pie_sum_by_category",
+    entity: "generic",
+    title: "Доли суммы по категориям",
+    description:
+      "Круговая диаграмма: та же первая текстовая и числовая колонка, что и для столбчатой суммы.",
+    resolve(columns) {
+      const x = firstCategoryColumnGeneric(columns);
+      const y = firstNumberColumn(columns);
+      if (!x) {
+        return {
+          ok: false,
+          error: "Нет текстовой колонки для сегментов.",
+        };
+      }
+      if (!y) {
+        return { ok: false, error: "Нет числовой колонки для суммы." };
+      }
+      if (x.key === y.key) {
+        return { ok: false, error: "Нужны две разные колонки." };
+      }
+      return { ok: true, config: pieSum(x, y) };
+    },
+  },
+  {
+    id: "generic_line_sum_by_date",
+    entity: "generic",
+    title: "Сумма по датам (линия)",
+    description:
+      "Первая колонка с датой и первая числовая — динамика суммы по дням.",
+    resolve(columns) {
+      const x = dateLikeColumn(columns);
+      const y = firstNumberColumn(columns);
+      if (!x) {
+        return { ok: false, error: "Нет колонки с датой." };
+      }
+      if (!y) {
+        return { ok: false, error: "Нет числовой колонки для суммы." };
+      }
+      if (x.key === y.key) {
+        return { ok: false, error: "Нужны две разные колонки." };
+      }
+      return { ok: true, config: lineSum(x, y) };
+    },
+  },
+  {
+    id: "generic_area_sum_by_date",
+    entity: "generic",
+    title: "Сумма по датам (область)",
+    description:
+      "То же, что линия по датам, с заливкой под кривой.",
+    resolve(columns) {
+      const x = dateLikeColumn(columns);
+      const y = firstNumberColumn(columns);
+      if (!x) {
+        return { ok: false, error: "Нет колонки с датой." };
+      }
+      if (!y) {
+        return { ok: false, error: "Нет числовой колонки для суммы." };
+      }
+      if (x.key === y.key) {
+        return { ok: false, error: "Нужны две разные колонки." };
+      }
+      return { ok: true, config: areaSum(x, y) };
+    },
+  },
 ];
 
 export function getSpecById(id: string): PredefinedChartSpec | undefined {
@@ -3172,12 +3377,17 @@ const ENTITY_SUGGEST_PRIMARY: EntityBlockId[] = [
   "quotes",
 ];
 
+/**
+ * Порядок важен: первое совпадение выигрывает.
+ * Сделки — раньше компаний: в одном имени могут быть и COMPANY, и DEAL (выгрузка Битрикс24);
+ * при наличии DEAL/DEALS файл считается выгрузкой сделок.
+ */
 const FILE_ENTITY_MARKERS: {
   entity: EntityBlockId;
   markers: string[];
 }[] = [
-  { entity: "companies", markers: ["COMPANY", "COMPANIES"] },
   { entity: "deals", markers: ["DEAL", "DEALS"] },
+  { entity: "companies", markers: ["COMPANY", "COMPANIES"] },
   { entity: "leads", markers: ["LEAD", "LEADS"] },
   { entity: "contacts", markers: ["CONTACT", "CONTACTS"] },
   { entity: "quotes", markers: ["QUOTE", "QUOTES", "KP", "COMMERCIAL"] },
@@ -3197,6 +3407,101 @@ function feasibleChartIdsForEntity(
     }
   }
   return chartIds;
+}
+
+/**
+ * Автоподбор сущности: не считать файл «сделками», если ни одна колонка не
+ * похожа на стадию/воронку (иначе любая первая строка давала бы раздел «Сделки»).
+ */
+function dealStageColumnLooksPlausible(columns: ColumnMeta[]): boolean {
+  for (const c of columns) {
+    if (c.inferredType !== "string" && c.inferredType !== "unknown") {
+      continue;
+    }
+    const t = `${normHeader(c.header)} ${normHeader(c.key)}`;
+    if (
+      /стади|статус|воронк|этап|pipeline|stage|сделк|deal|funnel|status/i.test(
+        t,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function leadStageColumnLooksPlausible(columns: ColumnMeta[]): boolean {
+  for (const c of columns) {
+    if (c.inferredType !== "string" && c.inferredType !== "unknown") {
+      continue;
+    }
+    const t = `${normHeader(c.header)} ${normHeader(c.key)}`;
+    if (
+      /стади|статус|воронк|этап|pipeline|stage|лид|lead|funnel|status/i.test(t)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Колонка похожа на выгрузку контактов, а не на произвольную таблицу. */
+function contactExportLooksPlausible(columns: ColumnMeta[]): boolean {
+  for (const c of columns) {
+    const t = `${normHeader(c.header)} ${normHeader(c.key)}`;
+    if (
+      /контакт|contact|email|e-mail|телефон|phone|mobile|mail|имя|фамилия/i.test(
+        t,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function quotesExportLooksPlausible(columns: ColumnMeta[]): boolean {
+  for (const c of columns) {
+    const t = `${normHeader(c.header)} ${normHeader(c.key)}`;
+    if (/кп|quote|предложен|commercial|estimate|offer|смет/i.test(t)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Колонка похожа на реестр компаний, а не на абстрактную таблицу. */
+function companyExportLooksPlausible(columns: ColumnMeta[]): boolean {
+  for (const c of columns) {
+    const t = `${normHeader(c.header)} ${normHeader(c.key)}`;
+    if (
+      /компани|company|контрагент|инн|огрн|отрасл|индустр|website|сайт|бренд|тип комп|регион|город|локац|сфера|деятельн/i.test(
+        t,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function feasibleChartIdsForEntitySuggestion(
+  entity: EntityBlockId,
+  columns: ColumnMeta[],
+): string[] {
+  if (entity === "deals" && !dealStageColumnLooksPlausible(columns)) {
+    return [];
+  }
+  if (entity === "leads" && !leadStageColumnLooksPlausible(columns)) {
+    return [];
+  }
+  if (entity === "contacts" && !contactExportLooksPlausible(columns)) {
+    return [];
+  }
+  if (entity === "quotes" && !quotesExportLooksPlausible(columns)) {
+    return [];
+  }
+  return feasibleChartIdsForEntity(entity, columns);
 }
 
 function primarySuggestScore(
@@ -3222,7 +3527,10 @@ function primarySuggestScore(
   return score;
 }
 
-/** Определяет сущность CRM по имени файла, если в нём есть явный маркер. */
+/**
+ * Определяет сущность CRM по имени файла, если в нём есть явный маркер
+ * (без учёта регистра). Для сделок: подстрока `DEAL` или `DEALS` (в т.ч. `crm_deal_export.xlsx`).
+ */
 export function suggestEntityFromFileName(fileName: string): EntityBlockId | null {
   const upper = fileName.toUpperCase();
   for (const { entity, markers } of FILE_ENTITY_MARKERS) {
@@ -3234,19 +3542,16 @@ export function suggestEntityFromFileName(fileName: string): EntityBlockId | nul
 }
 
 /**
- * Подбор раздела CRM и графиков по фактическим колонкам файла.
- * Сначала сравниваются лиды, сделки, контакты и КП (типовые выгрузки); блок
- * «Компании» с множеством пресетов на общих колонках учитывается только если
- * в первых четырёх разделах нет ни одного построимого графика.
- * Между лидами и сделками учитывается подпись колонки стадии («лид» / «сделк»).
- * При равенстве итогового счёта — первый раздел в порядке ENTITY_SUGGEST_PRIMARY.
+ * Подбор раздела и графиков по колонкам файла.
+ * Сначала — типичные сценарии CRM (лиды, сделки, контакты, КП), затем компании;
+ * если ни один не подошёл, используется блок «Универсально» (произвольная таблица).
  */
 export function suggestEntityAndCharts(columns: ColumnMeta[]): {
   entity: EntityBlockId;
   chartIds: string[];
 } | null {
   const primary = ENTITY_SUGGEST_PRIMARY.map((entity) => {
-    const chartIds = feasibleChartIdsForEntity(entity, columns);
+    const chartIds = feasibleChartIdsForEntitySuggestion(entity, columns);
     return {
       entity,
       chartIds,
@@ -3257,9 +3562,17 @@ export function suggestEntityAndCharts(columns: ColumnMeta[]): {
   if (maxScore > 0) {
     return primary.find((p) => p.score === maxScore)!;
   }
-  const companyIds = feasibleChartIdsForEntity("companies", columns);
+  const companyFeasible = feasibleChartIdsForEntity("companies", columns);
+  const companyIds =
+    companyExportLooksPlausible(columns) && companyFeasible.length > 0
+      ? companyFeasible
+      : [];
   if (companyIds.length > 0) {
     return { entity: "companies", chartIds: companyIds };
+  }
+  const genericIds = feasibleChartIdsForEntity("generic", columns);
+  if (genericIds.length > 0) {
+    return { entity: "generic", chartIds: genericIds };
   }
   return null;
 }
@@ -3270,9 +3583,71 @@ export function normalizeConfigForTabular(
 ): ChartConfig {
   const keys = new Set(data.columns.map((c) => c.key));
   const xKey = cfg.xKey && keys.has(cfg.xKey) ? cfg.xKey : null;
-  const yKeys = cfg.yKeys.filter((k) => keys.has(k));
+  const countDistinctByKey =
+    cfg.countDistinctByKey && keys.has(cfg.countDistinctByKey)
+      ? cfg.countDistinctByKey
+      : undefined;
   const filters = cfg.filters
     .filter((f) => keys.has(f.columnKey))
     .map((f) => ({ ...f }));
-  return { ...cfg, xKey, yKeys, filters };
+
+  const literalAvgBarsForYKeys = (
+    yKeysResolved: string[],
+  ): ChartConfig["literalAvgBars"] => {
+    if (!cfg.literalAvgBars?.length) {
+      return undefined;
+    }
+    return cfg.literalAvgBars
+      .filter(
+        (b) =>
+          keys.has(b.valueKey) &&
+          keys.has(b.seriesKey) &&
+          yKeysResolved.includes(b.seriesKey),
+      )
+      .map((b) => ({
+        ...b,
+        filters: b.filters
+          .filter((f) => keys.has(f.columnKey))
+          .map((f) => ({ ...f })),
+      }));
+  };
+
+  if (cfg.ySourceKeys && cfg.ySourceKeys.length === cfg.yKeys.length) {
+    const indices: number[] = [];
+    for (let i = 0; i < cfg.yKeys.length; i++) {
+      const yk = cfg.yKeys[i]!;
+      const src = cfg.ySourceKeys[i]!;
+      if (keys.has(yk) || keys.has(src)) {
+        indices.push(i);
+      }
+    }
+    const yKeys = indices.map((i) => cfg.yKeys[i]!);
+    const ySourceKeys = indices.map((i) => cfg.ySourceKeys![i]!);
+    const yAggregations =
+      cfg.yAggregations?.length === cfg.yKeys.length
+        ? indices.map((i) => cfg.yAggregations![i]!)
+        : undefined;
+    return {
+      ...cfg,
+      xKey,
+      yKeys,
+      ySourceKeys,
+      yAggregations,
+      countDistinctByKey,
+      filters,
+      literalAvgBars: literalAvgBarsForYKeys(yKeys),
+    };
+  }
+
+  const yKeys = cfg.yKeys.filter((k) => keys.has(k));
+  return {
+    ...cfg,
+    xKey,
+    yKeys,
+    ySourceKeys: undefined,
+    yAggregations: undefined,
+    countDistinctByKey,
+    filters,
+    literalAvgBars: literalAvgBarsForYKeys(yKeys),
+  };
 }

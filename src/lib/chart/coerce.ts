@@ -1,4 +1,7 @@
 const RU_DATE = /^(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/;
+/** дд/мм/гггг или дд-мм-гггг — тот же порядок, что и в RU_DATE с точками */
+const EU_SLASH_OR_DASH_DATE =
+  /^(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/;
 const ISO_DATE =
   /^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/;
 const ISO_TIMESTAMP_TZ =
@@ -73,7 +76,11 @@ function excelSerialToDate(value: number): Date | null {
   // Excel serial date (1900 system): days since 1899-12-30, fractional part is time.
   const ms = Math.round((value - 25569) * 86400 * 1000);
   const dt = new Date(ms);
-  return Number.isNaN(dt.getTime()) ? null : dt;
+  if (Number.isNaN(dt.getTime())) {
+    return null;
+  }
+  // Календарный день в локальной зоне (как в ячейке Excel), без «сдвига» времени суток.
+  return new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
 }
 
 export function formatDateYmdLocal(dt: Date): string {
@@ -81,6 +88,37 @@ export function formatDateYmdLocal(dt: Date): string {
   const m = String(dt.getMonth() + 1).padStart(2, "0");
   const d = String(dt.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+/** дд.мм.гггг по локальным календарным компонентам (как в Excel/Битрикс), без toLocaleDateString. */
+export function formatDateDdMmYyyyRuLocal(dt: Date): string {
+  const d = String(dt.getDate()).padStart(2, "0");
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const y = String(dt.getFullYear());
+  return `${d}.${m}.${y}`;
+}
+
+/**
+ * Дата и время для подписей и ячеек: дд.мм.гггг, при ненулевом времени — чч:мм или чч:мм:сс.
+ */
+export function formatDateTimeDdMmYyyyRuLocal(dt: Date): string {
+  const d = String(dt.getDate()).padStart(2, "0");
+  const mo = String(dt.getMonth() + 1).padStart(2, "0");
+  const y = String(dt.getFullYear());
+  const hh = dt.getHours();
+  const mm = dt.getMinutes();
+  const ss = dt.getSeconds();
+  const msec = dt.getMilliseconds();
+  const base = `${d}.${mo}.${y}`;
+  if (hh === 0 && mm === 0 && ss === 0 && msec === 0) {
+    return base;
+  }
+  const h = String(hh).padStart(2, "0");
+  const min = String(mm).padStart(2, "0");
+  if (ss === 0 && msec === 0) {
+    return `${base} ${h}:${min}`;
+  }
+  return `${base} ${h}:${min}:${String(ss).padStart(2, "0")}`;
 }
 
 export function tryParseNumber(value: unknown): number | null {
@@ -96,6 +134,38 @@ export function tryParseNumber(value: unknown): number | null {
   }
   const n = Number(normalized);
   return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Первое число — день, второе — месяц (дд.мм / дд/мм / дд-мм), как в типичной выгрузке Excel/Битрикс.
+ */
+function tryParseDmyMatch(m: RegExpMatchArray): Date | null {
+  const [, dayStr, monthStr, y, hh = "0", mm = "0", ss = "0"] = m;
+  const year = expandYear(y);
+  const h = Number(hh);
+  const min = Number(mm);
+  const sec = Number(ss);
+  return buildStrictLocalDate(
+    year,
+    Number(monthStr),
+    Number(dayStr),
+    h,
+    min,
+    sec,
+  );
+}
+
+/**
+ * Ячейка .xlsx с `cellDates: true` даёт `Date`, у которого локальные месяц и день
+ * соответствуют порядку мм/дд (US Excel), а не дд.мм как в выгрузке Битрикс24.
+ * Собираем календарную дату в интерпретации дд.мм: день и месяц меняются местами.
+ */
+export function reinterpretExcelDateAsRuDayMonth(d: Date): Date {
+  if (Number.isNaN(d.getTime())) {
+    return d;
+  }
+  const y = d.getFullYear();
+  return new Date(y, d.getDate() - 1, d.getMonth() + 1);
 }
 
 export function tryParseDate(value: unknown): Date | null {
@@ -114,15 +184,11 @@ export function tryParseDate(value: unknown): Date | null {
   }
   const ru = s.match(RU_DATE);
   if (ru) {
-    const [, d, m, y, hh = "0", mm = "0", ss = "0"] = ru;
-    return buildStrictLocalDate(
-      expandYear(y),
-      Number(m),
-      Number(d),
-      Number(hh),
-      Number(mm),
-      Number(ss),
-    );
+    return tryParseDmyMatch(ru);
+  }
+  const eu = s.match(EU_SLASH_OR_DASH_DATE);
+  if (eu) {
+    return tryParseDmyMatch(eu);
   }
   const iso = s.match(ISO_DATE);
   if (iso) {
@@ -137,6 +203,21 @@ export function tryParseDate(value: unknown): Date | null {
     );
   }
   if (ISO_TIMESTAMP_TZ.test(s)) {
+    const head = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+    if (head) {
+      const tailTime = /T(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(s);
+      const hh = tailTime ? Number(tailTime[1]) : 0;
+      const min = tailTime ? Number(tailTime[2]) : 0;
+      const sec = tailTime && tailTime[3] ? Number(tailTime[3]) : 0;
+      return buildStrictLocalDate(
+        Number(head[1]),
+        Number(head[2]),
+        Number(head[3]),
+        hh,
+        min,
+        sec,
+      );
+    }
     const dt = new Date(s);
     return Number.isNaN(dt.getTime()) ? null : dt;
   }
@@ -144,12 +225,15 @@ export function tryParseDate(value: unknown): Date | null {
   return null;
 }
 
+/** Подпись для пустой ячейки при группировке; совпадает с `groupLabel` для null/"". */
+export const EMPTY_GROUP_LABEL = "(пусто)" as const;
+
 export function groupLabel(value: unknown): string {
   if (value === null || value === undefined || value === "") {
-    return "(пусто)";
+    return EMPTY_GROUP_LABEL;
   }
   if (value instanceof Date) {
-    return formatDateYmdLocal(value);
+    return formatDateTimeDdMmYyyyRuLocal(value);
   }
   return String(value);
 }

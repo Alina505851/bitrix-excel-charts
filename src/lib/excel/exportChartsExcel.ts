@@ -1,18 +1,27 @@
 import ExcelJS from "exceljs";
-import {
-  applyFilters,
-  buildAggregatedChartRows,
-} from "@/lib/chart/buildChartData";
-import type { ChartConfig, ChartFilter, TabularData } from "@/lib/types";
+import { buildAggregatedChartRows } from "@/lib/chart/buildChartData";
+import { seriesLegendLabel } from "@/lib/chart/seriesLegendLabel";
+import { buildLiveChartItems } from "@/lib/excel/buildLiveChartItems";
+import { buildSourceData } from "@/lib/excel/buildSourceData";
+import type { ExcelMainInfoLine } from "@/lib/excel/exportMainInfo";
+import type {
+  AggregationMode,
+  ChartConfig,
+  ChartFilter,
+  TabularData,
+} from "@/lib/types";
 import {
   ENTITY_BLOCKS,
   chartsForEntity,
   normalizeConfigForTabular,
+  type EntityBlockId,
   type PredefinedChartSpec,
 } from "@/lib/predefinedCharts";
-import { renderAggregatedChartPng } from "@/lib/excel/chartToPng";
+import { REPORT_INCLUDES_THROUGH_YMD } from "@/lib/report/reportThroughDate";
 
 export type ExcelExportTheme = "classic" | "vivid" | "minimal";
+
+export type { ExcelMainInfoLine } from "@/lib/excel/exportMainInfo";
 
 const SHEET_INVALID = /[:\\/?*[\]]/g;
 
@@ -89,7 +98,12 @@ function styleSummarySheet(
   ws: ExcelJS.Worksheet,
   tableRowStart: number,
   chartRows: number,
+  mainInfoLines?: ExcelMainInfoLine[],
 ): void {
+  const sectionBg = "FFE0E7FF";
+  const sectionFg = "FF4338CA";
+  const mainCount = mainInfoLines?.length ?? 0;
+
   ws.columns = [
     { width: 26 },
     { width: 42 },
@@ -104,8 +118,40 @@ function styleSummarySheet(
   t.alignment = { vertical: "middle", horizontal: "center" };
   ws.getRow(1).height = 40;
 
+  if (mainCount > 0) {
+    ws.mergeCells("A3:C3");
+    const sec = ws.getCell("A3");
+    sec.value = "Основные показатели";
+    sec.font = { bold: true, size: 12, color: { argb: sectionFg } };
+    sec.fill = fillSolid(sectionBg);
+    sec.border = thinBorder();
+    sec.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+    ws.getRow(3).height = 28;
+    for (let i = 0; i < mainCount; i++) {
+      const r = 4 + i;
+      const line = mainInfoLines![i]!;
+      const row = ws.getRow(r);
+      const bg = i % 2 === 0 ? XL.slate50 : XL.white;
+      row.getCell(1).font = { size: 11, color: { argb: XL.inkMuted }, bold: true };
+      row.getCell(1).alignment = { vertical: "middle" };
+      row.getCell(1).fill = fillSolid(bg);
+      row.getCell(1).border = thinBorder();
+      const c2 = row.getCell(2);
+      c2.font = { size: 11, color: { argb: XL.ink } };
+      c2.alignment = { vertical: "middle", wrapText: true };
+      c2.fill = fillSolid(bg);
+      c2.border = thinBorder();
+      if (typeof line.value === "number" && Number.isFinite(line.value)) {
+        c2.numFmt = summaryNumFmtForLabel(line.label);
+      }
+      row.getCell(3).fill = fillSolid(bg);
+      row.getCell(3).border = thinBorder();
+    }
+  }
+
+  const metaStart = mainCount > 0 ? 4 + mainCount + 1 : 3;
   const metaEnd = tableRowStart - 2;
-  for (let r = 3; r <= metaEnd; r++) {
+  for (let r = metaStart; r <= metaEnd; r++) {
     const row = ws.getRow(r);
     if (!row.getCell(1).value && !row.getCell(2).value) {
       continue;
@@ -205,13 +251,9 @@ function styleDataTableBlock(
         wrapText: true,
       };
       cell.border = thinBorder();
-      if (c > 1 && typeof cell.value === "number") {
-        cell.numFmt = "#,##0.##";
-      }
     }
   }
 
-  const end = colLetter(colCount - 1);
   ws.views = [{ state: "frozen", ySplit: headerRowIndex }];
 }
 
@@ -238,15 +280,51 @@ function styleMessageMerged(
   ws.getRow(row).height = 28;
 }
 
-function styleChartSectionLabel(ws: ExcelJS.Worksheet, row: number, colSpan: number): void {
+function styleExportSectionHeading(
+  ws: ExcelJS.Worksheet,
+  row: number,
+  colSpan: number,
+  title: string,
+): void {
   const end = colLetter(colSpan - 1);
   ws.mergeCells(`A${row}:${end}${row}`);
   const c = ws.getCell(`A${row}`);
-  c.value = "Диаграмма";
+  c.value = title;
   c.font = { size: 11, bold: true, color: { argb: XL.sky700 } };
   c.fill = fillSolid(XL.sky100);
-  c.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+  c.alignment = { vertical: "middle", horizontal: "left", indent: 1, wrapText: true };
   ws.getRow(row).height = 22;
+}
+
+function buildMethodologyNarrative(
+  spec: PredefinedChartSpec,
+  tabular: TabularData,
+  cfg: ChartConfig,
+): string {
+  const parts: string[] = [spec.description.trim()];
+  const xLabel = cfg.xKey ? columnTitle(tabular, cfg.xKey) : "";
+  parts.push(
+    `Ось категорий (X): «${xLabel}». Сначала применяются глобальные фильтры отчёта и фильтры пресета графика; затем строки группируются по подписи категории на оси X, и для каждой группы считаются значения серий в соответствии с режимом агрегации (сумма, среднее, число записей и т.д.). Таблица на листе совпадает с данными диаграммы.`,
+  );
+  if (cfg.dateGranularity && cfg.xKey) {
+    const xMeta = tabular.columns.find((c) => c.key === cfg.xKey);
+    if (xMeta?.inferredType === "date") {
+      parts.push(
+        `Шаг группировки по времени на оси X: ${cfg.dateGranularity} (календарные интервалы).`,
+      );
+    }
+  }
+  if (cfg.cumulative) {
+    parts.push(
+      "Включён накопительный итог: значение в точке включает сумму по предыдущим периодам на оси времени.",
+    );
+  }
+  if (cfg.chartType === "pie") {
+    parts.push(
+      "Круговая диаграмма: сектор соответствует категории на оси; величина пропорциональна метрике относительно суммы по всем категориям выборки.",
+    );
+  }
+  return parts.join("\n\n");
 }
 
 function styleResolveErrorSheet(
@@ -277,18 +355,44 @@ function finishEmptySheetStyles(
   styleDataTableBlock(ws, 6, colCount, 1);
 }
 
+const CHART_IDS_IGNORE_STAGE_GLOBAL_FILTERS = new Set<string>([
+  "deals_cumulative_count_by_month_area",
+]);
+
+function isStageLikeFilter(tabular: TabularData, f: ChartFilter): boolean {
+  const meta = tabular.columns.find((c) => c.key === f.columnKey);
+  const h = (meta?.header || f.columnKey || "").toLowerCase();
+  return /стад|stage|воронк|pipeline/.test(h);
+}
+
 function withGlobalFilters(
   cfg: ChartConfig,
   global: ChartFilter[],
+  tabular: TabularData,
+  chartId: string,
 ): ChartConfig {
+  const globalPrepared = CHART_IDS_IGNORE_STAGE_GLOBAL_FILTERS.has(chartId)
+    ? global.filter((f) => !isStageLikeFilter(tabular, f))
+    : global;
   return {
     ...cfg,
-    filters: [...global, ...cfg.filters],
+    filters: [...globalPrepared, ...cfg.filters],
   };
 }
 
 function columnTitle(data: TabularData, key: string): string {
   return data.columns.find((c) => c.key === key)?.header ?? key;
+}
+
+function exportSeriesColumnHeader(
+  tabular: TabularData,
+  cfg: ChartConfig,
+  index: number,
+  entity: EntityBlockId,
+): string {
+  const srcKey = cfg.ySourceKeys?.[index] ?? cfg.yKeys[index]!;
+  const agg = cfg.yAggregations?.[index] ?? cfg.aggregation;
+  return seriesLegendLabel(columnTitle(tabular, srcKey), agg, entity);
 }
 
 function sanitizeSheetName(raw: string, used: Set<string>): string {
@@ -306,9 +410,102 @@ function sanitizeSheetName(raw: string, used: Set<string>): string {
   return s;
 }
 
+/** Числовой формат Excel: рубли с разрядами; счётчики — целые с разрядами. */
+const EXCEL_NUM_FMT_RUB = '# ##0,00 "₽"';
+const EXCEL_NUM_FMT_COUNT = "# ##0";
+const EXCEL_NUM_FMT_PCT = "0.0%";
+const EXCEL_NUM_FMT_DAYS = "0.0";
+
+/** Как на листе Python: деньги / % / дни / счётчики по подписи строки KPI. */
+function summaryNumFmtForLabel(label: string): string {
+  const l = label.toLowerCase();
+  if (/(конверсия|темп роста)/.test(l)) {
+    return EXCEL_NUM_FMT_PCT;
+  }
+  if (/цикл/.test(l)) {
+    return EXCEL_NUM_FMT_DAYS;
+  }
+  if (
+    /(руб|₽|сумм|выруч|доход|чек|стоим|оплат|средн|денег)/.test(l)
+  ) {
+    return EXCEL_NUM_FMT_RUB;
+  }
+  return EXCEL_NUM_FMT_COUNT;
+}
+
+function numFmtForSeriesAggregation(agg: AggregationMode): string {
+  return agg === "sum" || agg === "avg" ? EXCEL_NUM_FMT_RUB : EXCEL_NUM_FMT_COUNT;
+}
+
+function applyChartDataNumberFormats(
+  ws: ExcelJS.Worksheet,
+  cfg: ChartConfig,
+  dataRowCount: number,
+  dataStartRow1Based: number,
+): void {
+  if (dataRowCount <= 0) {
+    return;
+  }
+  for (let r = 0; r < dataRowCount; r++) {
+    const row = ws.getRow(dataStartRow1Based + r);
+    for (let j = 0; j < cfg.yKeys.length; j++) {
+      const agg = cfg.yAggregations?.[j] ?? cfg.aggregation;
+      row.getCell(j + 2).numFmt = numFmtForSeriesAggregation(agg);
+    }
+  }
+}
+
+function sourceHeaderLooksLikeMoney(header: string): boolean {
+  const h = header.trim().toLowerCase();
+  return /сумма|amount|руб|₽|стоим|цена|выруч|оплат|бюджет|чек|доход|денег/i.test(
+    h,
+  );
+}
+
+function applySourceSheetNumberFormats(
+  ws: ExcelJS.Worksheet,
+  headers: string[],
+  dataRowCount: number,
+  dataStartRow1Based: number,
+): void {
+  if (dataRowCount <= 0 || headers.length === 0) {
+    return;
+  }
+  for (let r = 0; r < dataRowCount; r++) {
+    const row = ws.getRow(dataStartRow1Based + r);
+    for (let c = 0; c < headers.length; c++) {
+      const cell = row.getCell(c + 1);
+      const v = cell.value;
+      const isFormula =
+        v !== null &&
+        typeof v === "object" &&
+        "formula" in v &&
+        typeof (v as { formula?: unknown }).formula === "string";
+      if (isFormula || typeof v === "number") {
+        cell.numFmt = sourceHeaderLooksLikeMoney(headers[c] ?? "")
+          ? EXCEL_NUM_FMT_RUB
+          : EXCEL_NUM_FMT_COUNT;
+      }
+    }
+  }
+}
+
+/** Число в ячейке — формула =n (пересчитываемая ячейка, тот же результат). */
+function cellValueForExport(
+  cell: string | number,
+): string | number | ExcelJS.CellFormulaValue {
+  if (typeof cell === "number" && Number.isFinite(cell)) {
+    return {
+      formula: `=${cell}`,
+      result: cell,
+    };
+  }
+  return cell;
+}
+
 function addMatrix(ws: ExcelJS.Worksheet, aoa: (string | number)[][]) {
   for (const row of aoa) {
-    ws.addRow(row);
+    ws.addRow(row.map((cell) => cellValueForExport(cell)));
   }
 }
 
@@ -338,6 +535,96 @@ type PreparedChartSheet =
       error: string;
     };
 
+function addMethodologyAndLegendBlocks(
+  ws: ExcelJS.Worksheet,
+  tabular: TabularData,
+  p: PreparedChartSheet & { kind: "data" },
+  span: number,
+): void {
+  const end = colLetter(span - 1);
+  ws.addRow([]);
+  const rHead = ws.rowCount;
+  styleExportSectionHeading(ws, rHead, span, "Методика расчёта");
+  ws.addRow([]);
+  const rBody = ws.rowCount;
+  ws.mergeCells(`A${rBody}:${end}${rBody}`);
+  const narrative = buildMethodologyNarrative(p.spec, tabular, p.cfg);
+  const bodyCell = ws.getCell(`A${rBody}`);
+  bodyCell.value = narrative;
+  bodyCell.font = { size: 10, color: { argb: XL.ink } };
+  bodyCell.alignment = { vertical: "top", wrapText: true, indent: 1 };
+  bodyCell.fill = fillSolid(XL.slate50);
+  bodyCell.border = thinBorder();
+  const approxLines = narrative.split(/\r?\n/).reduce((acc, line) => {
+    return acc + Math.max(1, Math.ceil(line.length / 88));
+  }, 0);
+  ws.getRow(rBody).height = Math.min(240, Math.max(56, approxLines * 13 + 16));
+
+  ws.addRow([]);
+  const rLegTitle = ws.rowCount;
+  styleExportSectionHeading(
+    ws,
+    rLegTitle,
+    span,
+    "Легенда серий (к диаграмме и таблице)",
+  );
+  ws.addRow([]);
+  const rHdr = ws.rowCount;
+  ws.getRow(rHdr).getCell(1).value = "Обозначение";
+  ws.getRow(rHdr).getCell(2).value = "Описание метрики";
+  if (span > 2) {
+    ws.mergeCells(`B${rHdr}:${end}${rHdr}`);
+  }
+  for (let c = 1; c <= span; c++) {
+    const cell = ws.getRow(rHdr).getCell(c);
+    cell.font = { bold: true, size: 10, color: { argb: XL.white } };
+    cell.fill = fillSolid(XL.sky500);
+    cell.border = thinBorder(XL.sky700);
+    cell.alignment = {
+      vertical: "middle",
+      horizontal: "left",
+      wrapText: true,
+      indent: c === 1 ? 1 : 0,
+    };
+  }
+  ws.getRow(rHdr).height = 22;
+
+  for (let i = 0; i < p.cfg.yKeys.length; i++) {
+    ws.addRow([]);
+    const rr = ws.rowCount;
+    const desc = exportSeriesColumnHeader(
+      tabular,
+      p.cfg,
+      i,
+      p.block.id,
+    );
+    ws.getRow(rr).getCell(1).value = `Серия ${i + 1}`;
+    ws.getRow(rr).getCell(2).value = desc;
+    if (span > 2) {
+      ws.mergeCells(`B${rr}:${end}${rr}`);
+    }
+    const zebra = i % 2 === 0 ? XL.white : XL.slate50;
+    for (let c = 1; c <= span; c++) {
+      const cell = ws.getRow(rr).getCell(c);
+      cell.fill = fillSolid(zebra);
+      cell.border = thinBorder();
+      cell.font = { size: 10, color: { argb: XL.ink } };
+      cell.alignment = {
+        vertical: "top",
+        wrapText: true,
+        indent: c === 1 ? 1 : 0,
+      };
+    }
+    ws.getRow(rr).height = Math.min(
+      120,
+      18 + Math.ceil(desc.length / 70) * 12,
+    );
+  }
+
+  ws.getColumn(1).width = Math.max(ws.getColumn(1).width ?? 8, 18);
+  ws.getColumn(2).width = Math.max(ws.getColumn(2).width ?? 8, 56);
+}
+
 function listEnabledCharts(
   enabledChartIds: Set<string>,
 ): { block: BlockInfo; spec: PredefinedChartSpec }[] {
@@ -356,6 +643,7 @@ function prepareChartSheets(
   tabular: TabularData,
   enabledChartIds: Set<string>,
   globalFilters: ChartFilter[],
+  dealStageOrder?: string[] | null,
 ): PreparedChartSheet[] {
   const prepared: PreparedChartSheet[] = [];
 
@@ -373,8 +661,13 @@ function prepareChartSheets(
 
     const cfg = normalizeConfigForTabular(
       tabular,
-      withGlobalFilters(resolved.config, globalFilters),
+      withGlobalFilters(resolved.config, globalFilters, tabular, spec.id),
     );
+
+    const reportChartThroughYmd =
+      block.id === "deals" || block.id === "companies"
+        ? REPORT_INCLUDES_THROUGH_YMD
+        : undefined;
 
     if (!cfg.xKey || cfg.yKeys.length === 0) {
       prepared.push({
@@ -389,13 +682,17 @@ function prepareChartSheets(
 
     const headerRow = [
       columnTitle(tabular, cfg.xKey),
-      ...cfg.yKeys.map((k) => columnTitle(tabular, k)),
+      ...cfg.yKeys.map((_, i) =>
+        exportSeriesColumnHeader(tabular, cfg, i, block.id),
+      ),
     ];
 
     const { data, warnings } = buildAggregatedChartRows(
       tabular.rows,
       cfg,
       tabular.columns,
+      dealStageOrder,
+      reportChartThroughYmd,
     );
 
     if (data.length === 0) {
@@ -438,8 +735,33 @@ function summaryStatusText(p: PreparedChartSheet): string {
 }
 
 export type ExportChartsResult =
-  | { ok: true; fileName: string; sheetsWritten: number; buffer?: ArrayBuffer }
+  | {
+      ok: true;
+      fileName: string;
+      sheetsWritten: number;
+      buffer?: ArrayBuffer;
+      /** Встроенные диаграммы Excel — только при успешной генерации через Python (/api/export-charts). */
+      chartsEmbedded: boolean;
+      /** Если графики не встроены, но файл скачан (запасной путь ExcelJS). */
+      warning?: string;
+    }
   | { ok: false; error: string };
+
+function enrichExportChartsErrorMessage(message: string): string {
+  const m = message.toLowerCase();
+  if (m.includes("no module named 'xlsxwriter'") || m.includes("no module named xlsxwriter")) {
+    return `${message.trim()} Установите: pip install xlsxwriter`;
+  }
+  if (message.includes("NO_PYTHON")) {
+    return "Не найден Python (python3 / python). Встроенные диаграммы в Excel формируются скриптом на Python 3 с пакетом xlsxwriter.";
+  }
+  return message.trim();
+}
+
+function fallbackChartsWarning(apiError: string): string {
+  const hint = enrichExportChartsErrorMessage(apiError);
+  return `Без встроенных диаграмм (в файле — таблицы и сводка). Не удалось вызвать генератор с графиками: ${hint}`;
+}
 
 function toArrayBuffer(buf: ExcelJS.Buffer): ArrayBuffer {
   if (buf instanceof ArrayBuffer) {
@@ -472,15 +794,45 @@ async function exportChartsViaApi(
   fileNameBase?: string,
   sourceFileName?: string,
   theme: ExcelExportTheme = "classic",
+  dealStageOrder?: string[] | null,
+  mainInfo?: ExcelMainInfoLine[],
 ): Promise<ExportChartsResult> {
   try {
-    const res = await fetch("/api/export-charts", {
+    const apiUrl =
+      typeof window !== "undefined"
+        ? new URL("/api/export-charts", window.location.origin).toString()
+        : "/api/export-charts";
+    const charts = buildLiveChartItems(
+      tabular,
+      enabledChartIds,
+      globalFilters,
+      dealStageOrder?.length ? dealStageOrder : null,
+    );
+    if (charts.length === 0) {
+      return {
+        ok: false,
+        error:
+          "Нет данных для построения диаграмм по выбранным отчётам — проверьте сущность и графики.",
+      };
+    }
+    const sourceData = buildSourceData(tabular);
+    const summary = {
+      createdAt: new Date().toLocaleString("ru-RU", {
+        dateStyle: "short",
+        timeStyle: "medium",
+      }),
+      sourceFileName: sourceFileName ?? "",
+      activeSheet: tabular.activeSheet,
+      columnsTotal: tabular.columns.length,
+      mainInfo: mainInfo?.length ? mainInfo : [],
+    };
+    const res = await fetch(apiUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        tabular,
-        enabledChartIds: [...enabledChartIds],
-        globalFilters,
+        charts,
+        sourceData,
+        summary,
         fileNameBase,
         sourceFileName,
         theme,
@@ -510,7 +862,7 @@ async function exportChartsViaApi(
     a.click();
     URL.revokeObjectURL(url);
     const sheetsWritten = Number(res.headers.get("x-sheets-written") || "0") || 0;
-    return { ok: true, fileName, sheetsWritten };
+    return { ok: true, fileName, sheetsWritten, chartsEmbedded: true };
   } catch {
     return {
       ok: false,
@@ -519,53 +871,15 @@ async function exportChartsViaApi(
   }
 }
 
-async function appendChartImageIfPossible(
-  workbook: ExcelJS.Workbook,
+/** Методика и легенда под таблицей. */
+function appendMethodologyAndLegendForDataSheet(
   worksheet: ExcelJS.Worksheet,
   tabular: TabularData,
   p: PreparedChartSheet & { kind: "data" },
   colSpan: number,
-): Promise<void> {
-  const labels = p.dataRows.map((row) => String(row.name));
-  const series = p.cfg.yKeys.map((k) => ({
-    label: columnTitle(tabular, k),
-    values: p.dataRows.map((row) => {
-      const v = row[k];
-      return typeof v === "number" && Number.isFinite(v) ? v : Number(v) || 0;
-    }),
-  }));
-
+): void {
   const span = Math.max(4, colSpan);
-
-  const base64 = await renderAggregatedChartPng({
-    chartType: p.cfg.chartType,
-    labels,
-    series,
-    entity: p.block.id,
-  });
-  if (!base64) {
-    worksheet.addRow([]);
-    const r = worksheet.rowCount;
-    styleMessageMerged(worksheet, r, span, "Диаграмма не сформирована", {
-      kind: "muted",
-    });
-    return;
-  }
-
-  const imageId = workbook.addImage({
-    base64,
-    extension: "png",
-  });
-
-  worksheet.addRow([]);
-  const labelRow = worksheet.rowCount;
-  styleChartSectionLabel(worksheet, labelRow, span);
-  worksheet.addRow([]);
-  const anchorRow = worksheet.rowCount;
-  worksheet.addImage(imageId, {
-    tl: { col: 0, row: anchorRow },
-    ext: { width: 760, height: 420 },
-  });
+  addMethodologyAndLegendBlocks(worksheet, tabular, p, span);
 }
 
 export async function exportChartsToExcelFile(
@@ -576,8 +890,12 @@ export async function exportChartsToExcelFile(
     fileNameBase?: string;
     sourceFileName?: string;
     theme?: ExcelExportTheme;
+    /** Порядок стадий сделки (как в боковой панели). */
+    dealStageOrder?: string[] | null;
     /** Для тестов: не скачивать файл, вернуть буфер книги. */
     returnBuffer?: boolean;
+    /** Блок «Основные показатели» на первом листе (как в боковой сводке). */
+    mainInfo?: ExcelMainInfoLine[];
   },
 ): Promise<ExportChartsResult> {
   if (enabledChartIds.size === 0) {
@@ -588,25 +906,35 @@ export async function exportChartsToExcelFile(
     };
   }
 
-  if (
-    !options?.returnBuffer &&
-    typeof window !== "undefined" &&
-    typeof document !== "undefined"
-  ) {
-    return exportChartsViaApi(
+  const isBrowser =
+    typeof window !== "undefined" && typeof document !== "undefined";
+  const tryApiFirst = !options?.returnBuffer && isBrowser;
+
+  let apiErrorForFallback: string | null = null;
+  if (tryApiFirst) {
+    const apiResult = await exportChartsViaApi(
       tabular,
       enabledChartIds,
       globalFilters,
       options?.fileNameBase,
       options?.sourceFileName,
       options?.theme ?? "classic",
+      options?.dealStageOrder,
+      options?.mainInfo,
     );
+    if (apiResult.ok) {
+      return apiResult;
+    }
+    apiErrorForFallback = apiResult.error;
+    /* Сервер недоступен или Python/xlsxwriter не собрали файл — выгрузка через ExcelJS
+       (таблицы и методика; встроенные диаграммы Excel только при успешном ответе /api). */
   }
 
   const prepared = prepareChartSheets(
     tabular,
     enabledChartIds,
     globalFilters,
+    options?.dealStageOrder,
   );
 
   if (prepared.length === 0) {
@@ -616,8 +944,6 @@ export async function exportChartsToExcelFile(
         "Не удалось подготовить листы: проверьте соответствие выгрузки типу графиков.",
     };
   }
-
-  const filteredRowCount = applyFilters(tabular.rows, globalFilters).length;
 
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "Отчёты Excel · Битрикс";
@@ -629,16 +955,24 @@ export async function exportChartsToExcelFile(
     timeStyle: "medium",
   });
 
+  const mainLines = options?.mainInfo ?? [];
   const summaryAoa: (string | number)[][] = [
     ["Общая информация"],
     [],
-    ["Дата формирования", summaryStamp],
+  ];
+  if (mainLines.length > 0) {
+    summaryAoa.push(["Основные показатели", "", ""]);
+    for (const line of mainLines) {
+      summaryAoa.push([line.label, line.value, ""]);
+    }
+    summaryAoa.push([]);
+  }
+  summaryAoa.push(
+    ["Дата формирования", summaryStamp, ""],
     ...(options?.sourceFileName
-      ? ([["Исходный файл", options.sourceFileName]] as (string | number)[][])
+      ? ([["Исходный файл", options.sourceFileName, ""]] as (string | number)[][])
       : []),
-    ["Строк на листе", tabular.rows.length],
-    ["Строк после фильтров", filteredRowCount],
-    ["Графиков в файле", prepared.length],
+    ["Графиков в файле", prepared.length, ""],
     [],
     ["Раздел", "График", "Статус"],
     ...prepared.map((p) => [
@@ -646,15 +980,36 @@ export async function exportChartsToExcelFile(
       p.spec.title,
       summaryStatusText(p),
     ]),
-  ];
+  );
 
   const summaryName = sanitizeSheetName("Общая информация", usedSheetNames);
   const wsSummary = workbook.addWorksheet(summaryName);
   addMatrix(wsSummary, summaryAoa);
-  const summaryTableHeaderRow = 9 + (options?.sourceFileName ? 1 : 0);
-  styleSummarySheet(wsSummary, summaryTableHeaderRow, prepared.length);
+  const chartTableHeaderIdx = summaryAoa.findIndex(
+    (r) => r[0] === "Раздел" && r[1] === "График",
+  );
+  const summaryTableHeaderRow =
+    chartTableHeaderIdx >= 0 ? chartTableHeaderIdx + 1 : 9;
+  styleSummarySheet(wsSummary, summaryTableHeaderRow, prepared.length, mainLines);
 
   let sheetsWritten = 1;
+
+  const { headers: srcHeaders, rows: srcRows } = buildSourceData(tabular);
+  if (srcHeaders.length > 0) {
+    const srcSheetName = sanitizeSheetName("Исходные данные", usedSheetNames);
+    const wsSrc = workbook.addWorksheet(srcSheetName);
+    const srcColCount = srcHeaders.length;
+    addMatrix(wsSrc, [
+      ["Исходные данные"],
+      [],
+      srcHeaders,
+      ...srcRows,
+    ]);
+    styleChartTitleRow(wsSrc, srcColCount, "Исходные данные");
+    styleDataTableBlock(wsSrc, 3, srcColCount, srcRows.length);
+    applySourceSheetNumberFormats(wsSrc, srcHeaders, srcRows.length, 4);
+    sheetsWritten++;
+  }
 
   for (const p of prepared) {
     const sheetTitle = `${p.block.label} — ${p.spec.title}`;
@@ -697,8 +1052,9 @@ export async function exportChartsToExcelFile(
     addMatrix(ws, [[title], [], p.headerRow, ...dataRows]);
     styleChartTitleRow(ws, Math.max(4, colCount), title);
     styleDataTableBlock(ws, 3, colCount, p.dataRows.length);
+    applyChartDataNumberFormats(ws, p.cfg, p.dataRows.length, 4);
 
-    await appendChartImageIfPossible(workbook, ws, tabular, p, colCount);
+    appendMethodologyAndLegendForDataSheet(ws, tabular, p, colCount);
   }
 
   const fileName = buildExportDownloadFileName(options?.fileNameBase);
@@ -706,13 +1062,32 @@ export async function exportChartsToExcelFile(
   const rawBuffer = await workbook.xlsx.writeBuffer();
   const arrayBuffer = toArrayBuffer(rawBuffer);
 
+  const chartsEmbedded = false;
+  const warning =
+    tryApiFirst && apiErrorForFallback
+      ? fallbackChartsWarning(apiErrorForFallback)
+      : undefined;
+
   if (options?.returnBuffer) {
-    return { ok: true, fileName, sheetsWritten, buffer: arrayBuffer };
+    return {
+      ok: true,
+      fileName,
+      sheetsWritten,
+      buffer: arrayBuffer,
+      chartsEmbedded,
+      ...(warning ? { warning } : {}),
+    };
   }
 
   if (typeof window !== "undefined" && typeof document !== "undefined") {
     downloadBlob(fileName, rawBuffer);
   }
 
-  return { ok: true, fileName, sheetsWritten };
+  return {
+    ok: true,
+    fileName,
+    sheetsWritten,
+    chartsEmbedded,
+    ...(warning ? { warning } : {}),
+  };
 }

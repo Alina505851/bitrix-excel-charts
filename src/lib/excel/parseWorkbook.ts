@@ -1,4 +1,5 @@
 import * as XLSX from "xlsx";
+import { tryParseDate } from "@/lib/chart/coerce";
 import type { ColumnMeta, InferredType, TabularData } from "@/lib/types";
 
 const SAMPLE_LIMIT = 50;
@@ -30,126 +31,6 @@ function tryParseNumber(value: unknown): number | null {
   }
   const n = Number(normalized);
   return Number.isFinite(n) ? n : null;
-}
-
-const RU_DATE = /^(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/;
-const ISO_DATE =
-  /^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/;
-const ISO_TIMESTAMP_TZ =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i;
-
-function expandYear(y: string): number {
-  if (y.length === 4) {
-    return Number(y);
-  }
-  const yy = Number(y);
-  return yy >= 70 ? 1900 + yy : 2000 + yy;
-}
-
-function buildStrictLocalDate(
-  year: number,
-  month: number,
-  day: number,
-  hour: number,
-  minute: number,
-  second: number,
-): Date | null {
-  if (
-    !Number.isInteger(year) ||
-    !Number.isInteger(month) ||
-    !Number.isInteger(day) ||
-    !Number.isInteger(hour) ||
-    !Number.isInteger(minute) ||
-    !Number.isInteger(second)
-  ) {
-    return null;
-  }
-  if (
-    month < 1 ||
-    month > 12 ||
-    day < 1 ||
-    day > 31 ||
-    hour < 0 ||
-    hour > 23 ||
-    minute < 0 ||
-    minute > 59 ||
-    second < 0 ||
-    second > 59
-  ) {
-    return null;
-  }
-  const dt = new Date(year, month - 1, day, hour, minute, second);
-  if (Number.isNaN(dt.getTime())) {
-    return null;
-  }
-  if (
-    dt.getFullYear() !== year ||
-    dt.getMonth() !== month - 1 ||
-    dt.getDate() !== day ||
-    dt.getHours() !== hour ||
-    dt.getMinutes() !== minute ||
-    dt.getSeconds() !== second
-  ) {
-    return null;
-  }
-  return dt;
-}
-
-function excelSerialToDate(value: number): Date | null {
-  if (!Number.isFinite(value)) {
-    return null;
-  }
-  if (value < 20_000 || value > 80_000) {
-    return null;
-  }
-  const ms = Math.round((value - 25569) * 86400 * 1000);
-  const dt = new Date(ms);
-  return Number.isNaN(dt.getTime()) ? null : dt;
-}
-
-function tryParseDate(value: unknown): Date | null {
-  if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    return value;
-  }
-  if (typeof value === "number") {
-    return excelSerialToDate(value);
-  }
-  if (typeof value !== "string") {
-    return null;
-  }
-  const s = value.trim();
-  if (!s) {
-    return null;
-  }
-  const ru = s.match(RU_DATE);
-  if (ru) {
-    const [, d, m, y, hh = "0", mm = "0", ss = "0"] = ru;
-    return buildStrictLocalDate(
-      expandYear(y),
-      Number(m),
-      Number(d),
-      Number(hh),
-      Number(mm),
-      Number(ss),
-    );
-  }
-  const iso = s.match(ISO_DATE);
-  if (iso) {
-    const [, y, m, d, hh = "0", mm = "0", ss = "0"] = iso;
-    return buildStrictLocalDate(
-      Number(y),
-      Number(m),
-      Number(d),
-      Number(hh),
-      Number(mm),
-      Number(ss),
-    );
-  }
-  if (ISO_TIMESTAMP_TZ.test(s)) {
-    const dt = new Date(s);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-  return null;
 }
 
 function inferTypeFromValues(values: unknown[]): InferredType {
@@ -210,19 +91,60 @@ function buildRows(
   body: unknown[][],
 ): Record<string, unknown>[] {
   const rows: Record<string, unknown>[] = [];
+  const norm = (v: unknown) => String(v ?? "").trim().toLowerCase();
   for (const line of body) {
     const row: Record<string, unknown> = {};
+    let nonEmptyCount = 0;
+    let headerEchoCount = 0;
     for (let i = 0; i < headerKeys.length; i++) {
-      row[headerKeys[i]] = line[i] ?? "";
+      const value = line[i] ?? "";
+      row[headerKeys[i]] = value;
+      if (value !== "" && value !== null && value !== undefined) {
+        nonEmptyCount++;
+        if (norm(value) === norm(headerKeys[i])) {
+          headerEchoCount++;
+        }
+      }
     }
-    const hasValue = Object.values(row).some(
-      (v) => v !== "" && v !== null && v !== undefined,
-    );
-    if (hasValue) {
+    const hasValue = nonEmptyCount > 0;
+    const isHeaderEchoNoise = nonEmptyCount > 0 && headerEchoCount === nonEmptyCount;
+    if (hasValue && !isHeaderEchoNoise) {
       rows.push(row);
     }
   }
   return rows;
+}
+
+function normalizeExcelDateObjectsToCalendarDay(
+  rows: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  if (rows.length === 0) {
+    return rows;
+  }
+  return rows.map((row) => {
+    const next: Record<string, unknown> = { ...row };
+    for (const [k, v] of Object.entries(next)) {
+      if (!(v instanceof Date) || Number.isNaN(v.getTime())) {
+        continue;
+      }
+      // Excel date-only ячейки из некоторых выгрузок приходят как 23:59:43
+      // предыдущего календарного дня. Корректируем только этот артефакт,
+      // не трогая реальные вечерние datetime.
+      if (
+        v.getHours() === 23 &&
+        v.getMinutes() === 59 &&
+        v.getSeconds() === 43
+      ) {
+        const shifted = new Date(v.getFullYear(), v.getMonth(), v.getDate() + 1);
+        next[k] = new Date(
+          shifted.getFullYear(),
+          shifted.getMonth(),
+          shifted.getDate(),
+        );
+      }
+    }
+    return next;
+  });
 }
 
 export type ParseResult =
@@ -281,6 +203,7 @@ export function parseWorkbookFromBuffer(
   if (rows.length > MAX_ROWS_WARN) {
     rows = rows.slice(0, MAX_ROWS_WARN);
   }
+  rows = normalizeExcelDateObjectsToCalendarDay(rows);
 
   const columnDefs = keys.map((key, i) => ({
     key,

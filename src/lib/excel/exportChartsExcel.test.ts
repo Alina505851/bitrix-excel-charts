@@ -1,10 +1,6 @@
 import ExcelJS from "exceljs";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { ColumnMeta, TabularData } from "@/lib/types";
-
-vi.mock("@/lib/excel/chartToPng", () => ({
-  renderAggregatedChartPng: vi.fn().mockResolvedValue(null),
-}));
 
 function leadTabular(rows: Record<string, unknown>[]): TabularData {
   const columns: ColumnMeta[] = [
@@ -30,10 +26,6 @@ function leadTabular(rows: Record<string, unknown>[]): TabularData {
 }
 
 describe("exportChartsToExcelFile", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
   it("returns error and does not return buffer when no charts selected", async () => {
     const { exportChartsToExcelFile } = await import(
       "@/lib/excel/exportChartsExcel"
@@ -68,14 +60,16 @@ describe("exportChartsToExcelFile", () => {
     expect(res.fileName).toMatch(
       /^report_графики_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.xlsx$/,
     );
-    expect(res.sheetsWritten).toBe(2);
+    expect(res.sheetsWritten).toBe(3);
     expect(res.buffer).toBeDefined();
+    expect(res.chartsEmbedded).toBe(false);
 
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(res.buffer!);
-    expect(wb.worksheets.length).toBe(2);
+    expect(wb.worksheets.length).toBe(3);
     expect(wb.worksheets[0]!.name).toContain("Общая");
-    expect(wb.worksheets[1]!.name).toMatch(/Лиды/i);
+    expect(wb.worksheets[1]!.name).toContain("Исходн");
+    expect(wb.worksheets[2]!.name).toMatch(/Лиды/i);
   });
 
   it("includes error sheet when chart cannot resolve", async () => {
@@ -105,10 +99,11 @@ describe("exportChartsToExcelFile", () => {
     if (!res.ok) {
       return;
     }
-    expect(res.sheetsWritten).toBe(2);
+    expect(res.sheetsWritten).toBe(3);
+    expect(res.chartsEmbedded).toBe(false);
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(res.buffer!);
-    expect(wb.worksheets.length).toBe(2);
+    expect(wb.worksheets.length).toBe(3);
   });
 
   it("writes empty-state sheet when filters exclude all rows", async () => {
@@ -125,10 +120,11 @@ describe("exportChartsToExcelFile", () => {
     if (!res.ok) {
       return;
     }
+    expect(res.chartsEmbedded).toBe(false);
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(res.buffer!);
-    expect(wb.worksheets.length).toBe(2);
-    const ws = wb.worksheets[1]!;
+    expect(wb.worksheets.length).toBe(3);
+    const ws = wb.worksheets[2]!;
     let flat = "";
     ws.eachRow((row) => {
       row.eachCell((cell) => {

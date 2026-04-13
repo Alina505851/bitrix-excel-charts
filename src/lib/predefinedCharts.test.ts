@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   PREDEFINED_CHARTS,
   chartsForEntity,
+  dealCycleClosedDateColumn,
+  dealStageOutcomeFromCell,
   getSpecById,
   normalizeConfigForTabular,
   suggestEntityAndCharts,
@@ -26,7 +28,7 @@ const leadColumnsMinimal: ColumnMeta[] = [
 ];
 
 describe("PREDEFINED_CHARTS registry", () => {
-  it("has unique ids and five entity sections", () => {
+  it("has unique ids and six entity sections", () => {
     const ids = PREDEFINED_CHARTS.map((c) => c.id);
     expect(new Set(ids).size).toBe(ids.length);
     expect(chartsForEntity("leads").length).toBeGreaterThan(0);
@@ -34,11 +36,33 @@ describe("PREDEFINED_CHARTS registry", () => {
     expect(chartsForEntity("contacts").length).toBeGreaterThan(0);
     expect(chartsForEntity("companies").length).toBeGreaterThan(0);
     expect(chartsForEntity("quotes").length).toBeGreaterThan(0);
+    expect(chartsForEntity("generic").length).toBeGreaterThan(0);
   });
 
   it("getSpecById returns spec or undefined", () => {
     expect(getSpecById("leads_sum_by_stage")?.entity).toBe("leads");
     expect(getSpecById("__missing__")).toBeUndefined();
+  });
+});
+
+describe("dealCycleClosedDateColumn", () => {
+  it("prefers factual close date and ignores generic update date", () => {
+    const cols: ColumnMeta[] = [
+      {
+        key: "upd",
+        header: "Дата изменения",
+        inferredType: "date",
+        sampleValues: [],
+      },
+      {
+        key: "closed_fact",
+        header: "Дата закрытия, факт",
+        inferredType: "date",
+        sampleValues: [],
+      },
+    ];
+    const found = dealCycleClosedDateColumn(cols);
+    expect(found?.key).toBe("closed_fact");
   });
 });
 
@@ -65,26 +89,6 @@ describe("PredefinedChartSpec.resolve", () => {
       },
     ]);
     expect(r.ok).toBe(false);
-  });
-
-  it("deals_count_by_company resolves with company header", () => {
-    const spec = getSpecById("deals_count_by_company")!;
-    const cols: ColumnMeta[] = [
-      {
-        key: "co",
-        header: "Компания",
-        inferredType: "string",
-        sampleValues: [],
-      },
-      {
-        key: "n",
-        header: "Сумма",
-        inferredType: "number",
-        sampleValues: [],
-      },
-    ];
-    const r = spec.resolve(cols);
-    expect(r.ok).toBe(true);
   });
 
   it("deals_sum_by_stage does not use pure ID column as amount", () => {
@@ -180,8 +184,8 @@ describe("PredefinedChartSpec.resolve", () => {
     expect(r.ok).toBe(false);
   });
 
-  it("leads_area_sum_by_date uses area chart and sum aggregation", () => {
-    const spec = getSpecById("leads_area_sum_by_date")!;
+  it("leads_sum_by_date uses line chart and sum aggregation", () => {
+    const spec = getSpecById("leads_sum_by_date")!;
     const cols: ColumnMeta[] = [
       {
         key: "dt",
@@ -194,13 +198,13 @@ describe("PredefinedChartSpec.resolve", () => {
     const r = spec.resolve(cols);
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.config.chartType).toBe("area");
+      expect(r.config.chartType).toBe("line");
       expect(r.config.aggregation).toBe("sum");
     }
   });
 
-  it("deals_won_q1_2026_sum_by_responsible includes Q1 2026 date bounds", () => {
-    const spec = getSpecById("deals_won_q1_2026_sum_by_responsible")!;
+  it("deals_avg_deal_dynamics uses won filters, avg, and month granularity", () => {
+    const spec = getSpecById("deals_avg_deal_dynamics")!;
     const cols: ColumnMeta[] = [
       {
         key: "st",
@@ -215,9 +219,38 @@ describe("PredefinedChartSpec.resolve", () => {
         sampleValues: [],
       },
       {
-        key: "mgr",
-        header: "Ответственный",
+        key: "amt",
+        header: "Сумма",
+        inferredType: "number",
+        sampleValues: [],
+      },
+    ];
+    const r = spec.resolve(cols);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.config.chartType).toBe("line");
+      expect(r.config.aggregation).toBe("avg");
+      expect(r.config.dateGranularity).toBe("month");
+      expect(r.config.filters[0]?.columnKey).toBe("st");
+      expect(r.config.filters[0]?.values?.includes("Успешно реализована")).toBe(
+        true,
+      );
+    }
+  });
+
+  it("deals_revenue_dynamics uses won-stage filters and line sum by day", () => {
+    const spec = getSpecById("deals_revenue_dynamics")!;
+    const cols: ColumnMeta[] = [
+      {
+        key: "st",
+        header: "Стадия сделки",
         inferredType: "string",
+        sampleValues: [],
+      },
+      {
+        key: "dt",
+        header: "Дата закрытия",
+        inferredType: "date",
         sampleValues: [],
       },
       {
@@ -230,15 +263,118 @@ describe("PredefinedChartSpec.resolve", () => {
     const r = spec.resolve(cols);
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.config.filters).toHaveLength(2);
-      const dateF = r.config.filters.find((f) => f.columnKey === "dt");
-      expect(dateF?.dateFrom).toBe("2026-01-01");
-      expect(dateF?.dateTo).toBe("2026-03-31");
+      expect(r.config.chartType).toBe("line");
+      expect(r.config.aggregation).toBe("sum");
+      expect(r.config.dateGranularity).toBeUndefined();
+      expect(r.config.filters[0]?.columnKey).toBe("st");
+      expect(r.config.filters[0]?.values?.includes("Успешно реализована")).toBe(
+        true,
+      );
     }
   });
 
-  it("deals_won_sum_by_responsible filters by typical won stage labels", () => {
-    const spec = getSpecById("deals_won_sum_by_responsible")!;
+  it("won revenue/avg charts prefer factual close date over generic update date", () => {
+    const specs = [getSpecById("deals_revenue_dynamics")!, getSpecById("deals_avg_deal_dynamics")!];
+    const cols: ColumnMeta[] = [
+      {
+        key: "st",
+        header: "Стадия сделки",
+        inferredType: "string",
+        sampleValues: [],
+      },
+      {
+        key: "changed",
+        header: "Дата изменения",
+        inferredType: "date",
+        sampleValues: [],
+      },
+      {
+        key: "closed_fact",
+        header: "Дата закрытия, факт",
+        inferredType: "date",
+        sampleValues: [],
+      },
+      {
+        key: "amt",
+        header: "Сумма",
+        inferredType: "number",
+        sampleValues: [],
+      },
+    ];
+    for (const spec of specs) {
+      const r = spec.resolve(cols);
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.config.xKey).toBe("closed_fact");
+      }
+    }
+  });
+
+  it("won count by month uses deal created date", () => {
+    const spec = getSpecById("deals_won_count_by_month")!;
+    const cols: ColumnMeta[] = [
+      {
+        key: "st",
+        header: "Стадия сделки",
+        inferredType: "string",
+        sampleValues: [],
+      },
+      {
+        key: "created",
+        header: "Дата создания",
+        inferredType: "date",
+        sampleValues: [],
+      },
+      {
+        key: "closed_fact",
+        header: "Дата закрытия, факт",
+        inferredType: "date",
+        sampleValues: [],
+      },
+      {
+        key: "amt",
+        header: "Сумма",
+        inferredType: "number",
+        sampleValues: [],
+      },
+    ];
+    const r = spec.resolve(cols);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.config.xKey).toBe("created");
+      expect(r.config.filters).toEqual([
+        { columnKey: "st", values: ["Сделка успешна"] },
+      ]);
+    }
+  });
+
+  it("deals_cumulative_count_by_month_area keeps cumulative monthly count config", () => {
+    const spec = getSpecById("deals_cumulative_count_by_month_area")!;
+    const cols: ColumnMeta[] = [
+      {
+        key: "id",
+        header: "ID",
+        inferredType: "number",
+        sampleValues: [],
+      },
+      {
+        key: "created",
+        header: "Дата создания сделки",
+        inferredType: "date",
+        sampleValues: [],
+      },
+    ];
+    const r = spec.resolve(cols);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.config.countDistinctByKey).toBeUndefined();
+      expect(r.config.cumulative).toBe(true);
+      expect(r.config.dateGranularity).toBe("month");
+    }
+  });
+
+  it("deals_won_sum_and_count_by_responsible filters by typical won stage labels and exposes two series", () => {
+    const spec = getSpecById("deals_won_sum_and_count_by_responsible")!;
     const cols: ColumnMeta[] = [
       {
         key: "st",
@@ -267,6 +403,92 @@ describe("PredefinedChartSpec.resolve", () => {
       expect(r.config.filters[0]?.values?.includes("Успешно реализована")).toBe(
         true,
       );
+      expect(r.config.yKeys).toEqual(["amt__won_sum", "amt__won_cnt"]);
+      expect(r.config.ySourceKeys).toEqual(["amt", "amt"]);
+      expect(r.config.yAggregations).toEqual(["sum", "count"]);
+    }
+  });
+
+  it("deals_kp_sent_sum_by_period uses Дата отправки КП, month sum and empty-date filter", () => {
+    const spec = getSpecById("deals_kp_sent_sum_by_period")!;
+    const cols: ColumnMeta[] = [
+      {
+        key: "kp_dt",
+        header: "Дата отправки КП",
+        inferredType: "date",
+        sampleValues: [],
+      },
+      {
+        key: "amt",
+        header: "Сумма",
+        inferredType: "number",
+        sampleValues: [],
+      },
+    ];
+    const r = spec.resolve(cols);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.config.xKey).toBe("kp_dt");
+      expect(r.config.yKeys).toEqual(["amt"]);
+      expect(r.config.chartType).toBe("line");
+      expect(r.config.aggregation).toBe("sum");
+      expect(r.config.dateGranularity).toBe("month");
+      expect(r.config.filters?.[0]?.excludeValues).toEqual(["(пусто)"]);
+    }
+  });
+
+  it("deals_kp_sent_count_by_period uses Дата отправки КП, month count and empty-date filter", () => {
+    const spec = getSpecById("deals_kp_sent_count_by_period")!;
+    const cols: ColumnMeta[] = [
+      {
+        key: "kp_dt",
+        header: "Дата отправки КП",
+        inferredType: "date",
+        sampleValues: [],
+      },
+      {
+        key: "amt",
+        header: "Сумма",
+        inferredType: "number",
+        sampleValues: [],
+      },
+    ];
+    const r = spec.resolve(cols);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.config.xKey).toBe("kp_dt");
+      expect(r.config.chartType).toBe("line");
+      expect(r.config.aggregation).toBe("count");
+      expect(r.config.dateGranularity).toBe("month");
+      expect(r.config.filters?.[0]?.excludeValues).toEqual(["(пусто)"]);
+    }
+  });
+
+  it("deals_kp_avg_and_check_at_send_stage falls back to deal sum when KP amount column is missing", () => {
+    const spec = getSpecById("deals_kp_avg_and_check_at_send_stage")!;
+    const cols: ColumnMeta[] = [
+      {
+        key: "st",
+        header: "Стадия сделки",
+        inferredType: "string",
+        sampleValues: [],
+      },
+      {
+        key: "amt",
+        header: "Сумма",
+        inferredType: "number",
+        sampleValues: [],
+      },
+    ];
+    const r = spec.resolve(cols);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.config.chartType).toBe("bar");
+      expect(r.config.aggregation).toBe("avg");
+      expect(r.config.yKeys).toEqual(["amt"]);
+      expect(r.config.literalAvgBars?.length).toBe(2);
+      expect(r.config.literalAvgBars?.[0]?.valueKey).toBe("amt");
+      expect(r.config.literalAvgBars?.[1]?.valueKey).toBe("amt");
     }
   });
 
@@ -653,6 +875,27 @@ describe("suggestEntityAndCharts", () => {
     const s = suggestEntityAndCharts([]);
     expect(s).toBeNull();
   });
+
+  it("falls back to generic for arbitrary category and number columns", () => {
+    const cols: ColumnMeta[] = [
+      {
+        key: "cat",
+        header: "Product",
+        inferredType: "string",
+        sampleValues: [],
+      },
+      {
+        key: "val",
+        header: "Amount",
+        inferredType: "number",
+        sampleValues: [],
+      },
+    ];
+    const s = suggestEntityAndCharts(cols);
+    expect(s).not.toBeNull();
+    expect(s!.entity).toBe("generic");
+    expect(s!.chartIds.some((id) => id.startsWith("generic_"))).toBe(true);
+  });
 });
 
 describe("suggestEntityFromFileName", () => {
@@ -664,6 +907,17 @@ describe("suggestEntityFromFileName", () => {
 
   it("detects deals by DEALS marker", () => {
     expect(suggestEntityFromFileName("DEALS_EXPORT_2026.xlsx")).toBe("deals");
+  });
+
+  it("detects deals by singular DEAL in file name", () => {
+    expect(suggestEntityFromFileName("crm_deal_list_2026.xlsx")).toBe("deals");
+    expect(suggestEntityFromFileName("export_DEAL_20260412.xls")).toBe("deals");
+  });
+
+  it("prefers deals over companies when both markers appear", () => {
+    expect(
+      suggestEntityFromFileName("COMPANY_DEAL_joint_export.xlsx"),
+    ).toBe("deals");
   });
 
   it("returns null for unknown file name", () => {
@@ -689,6 +943,28 @@ describe("normalizeConfigForTabular", () => {
     expect(normalized.xKey).toBeNull();
     expect(normalized.yKeys).toEqual(["amt"]);
     expect(normalized.filters).toEqual([]);
+  });
+
+  it("keeps synthetic yKeys when ySourceKeys point at real columns", () => {
+    const data: TabularData = {
+      sheetNames: ["S"],
+      activeSheet: "S",
+      columns: leadColumnsMinimal,
+      rows: [],
+    };
+    const normalized = normalizeConfigForTabular(data, {
+      xKey: "st",
+      yKeys: ["amt__a", "amt__b"],
+      ySourceKeys: ["amt", "amt"],
+      yAggregations: ["sum", "count"],
+      chartType: "bar",
+      aggregation: "sum",
+      filters: [],
+    });
+    expect(normalized.xKey).toBe("st");
+    expect(normalized.yKeys).toEqual(["amt__a", "amt__b"]);
+    expect(normalized.ySourceKeys).toEqual(["amt", "amt"]);
+    expect(normalized.yAggregations).toEqual(["sum", "count"]);
   });
 });
 
@@ -811,5 +1087,13 @@ describe("companies charts: field requirements and generation logic", () => {
     expect(out.warnings).toEqual([]);
     expect(out.data.find((d) => d.name === "Да")?.id).toBe(2);
     expect(out.data.find((d) => d.name === "Нет")?.id).toBe(1);
+  });
+});
+
+describe("dealStageOutcomeFromCell", () => {
+  it("marks CRM success and failure stages", () => {
+    expect(dealStageOutcomeFromCell("10. Сделка успешна")).toBe("won");
+    expect(dealStageOutcomeFromCell("11. Отказ / Тендер проигран")).toBe("lost");
+    expect(dealStageOutcomeFromCell("Подготовка КП")).toBe("open");
   });
 });

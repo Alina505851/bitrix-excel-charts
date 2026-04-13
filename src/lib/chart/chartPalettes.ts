@@ -1,8 +1,8 @@
 import type { EntityBlockId } from "@/lib/predefinedCharts";
 
-/** «Компании»: яркие разные оттенки без оранжевого (синий, бирюза, зелёный, пурпур, розовый). */
+/** «Компании» / единый стиль Excel-выгрузки: первый цвет как Accent1 (#0070C0), далее разнообразие рядов. */
 export const COMPANY_CHART_COLORS = [
-  "#2563eb",
+  "#0070C0",
   "#06b6d4",
   "#16a34a",
   "#f59e0b",
@@ -16,9 +16,28 @@ export const COMPANY_CHART_COLORS = [
   "#eab308",
 ];
 
+/** Круговая «Доля суммы по стадиям» (сделки): разнесённые по кругу оттенки, не одна гамма. */
+export const DEALS_STAGE_SUM_PIE_COLORS = [
+  "#6366f1",
+  "#0070C0",
+  "#0891b2",
+  "#0d9488",
+  "#16a34a",
+  "#65a30d",
+  "#ca8a04",
+  "#ea580c",
+  "#dc2626",
+  "#db2777",
+  "#c026d3",
+  "#9333ea",
+  "#7c3aed",
+  "#e11d48",
+  "#4f46e5",
+];
+
 /** Круговая «Распределение по ответственным»: насыщенные контрастные секторы. */
 export const COMPANIES_RESPONSIBLE_PIE_COLORS = [
-  "#2563eb",
+  "#0070C0",
   "#0891b2",
   "#0d9488",
   "#16a34a",
@@ -48,20 +67,8 @@ export const ENTITY_CHART_PALETTES: Record<EntityBlockId, string[]> = {
     "#818cf8",
     "#7dd3fc",
   ],
-  deals: [
-    "#a855f7",
-    "#9333ea",
-    "#d946ef",
-    "#c026d3",
-    "#e879f9",
-    "#8b5cf6",
-    "#c084fc",
-    "#a21caf",
-    "#7c3aed",
-    "#f0abfc",
-    "#6d28d9",
-    "#db2777",
-  ],
+  /** Сделки — те же цвета, что и «Компании» (графики и PNG в Excel как в эталоне). */
+  deals: COMPANY_CHART_COLORS,
   contacts: [
     "#10b981",
     "#22c55e",
@@ -90,6 +97,20 @@ export const ENTITY_CHART_PALETTES: Record<EntityBlockId, string[]> = {
     "#ef4444",
     "#9f1239",
     "#d946ef",
+  ],
+  generic: [
+    "#64748b",
+    "#475569",
+    "#0ea5e9",
+    "#06b6d4",
+    "#14b8a6",
+    "#8b5cf6",
+    "#a855f7",
+    "#d946ef",
+    "#ec4899",
+    "#f43f5e",
+    "#f59e0b",
+    "#84cc16",
   ],
 };
 

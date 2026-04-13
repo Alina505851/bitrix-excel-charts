@@ -112,13 +112,20 @@ export async function renderAggregatedChartPng(options: {
         options: {
           responsive: false,
           animation: false,
+          layout: {
+            padding: { top: 10, right: 8, bottom: 10, left: 8 },
+          },
           plugins: {
             legend: {
               position: "right",
+              align: "center",
               labels: {
-                boxWidth: 12,
-                padding: 10,
-                font: { size: 11, weight: "bold" },
+                boxWidth: 14,
+                boxHeight: 14,
+                padding: 14,
+                font: { size: 12, weight: 600, family: "system-ui, sans-serif" },
+                usePointStyle: true,
+                pointStyle: "rectRounded",
               },
             },
           },
@@ -184,6 +191,9 @@ export async function renderAggregatedChartPng(options: {
       options: {
         responsive: false,
         animation: false,
+        layout: {
+          padding: { top: 6, bottom: 8, left: 6, right: 6 },
+        },
         interaction: { mode: "index", intersect: false },
         scales: {
           x: {
@@ -212,11 +222,19 @@ export async function renderAggregatedChartPng(options: {
         plugins: {
           legend: {
             position: "top",
+            align: "center",
+            fullSize: true,
             labels: {
-              boxWidth: 14,
-              padding: 14,
-              font: { size: 12, weight: "bold" },
+              boxWidth: 16,
+              padding: 18,
+              font: {
+                size: 12,
+                weight: 600,
+                family: "system-ui, sans-serif",
+              },
               usePointStyle: true,
+              pointStyle: "rectRounded",
+              textAlign: "left",
             },
           },
         },

@@ -1,0 +1,2 @@
+# Встроенные диаграммы в Excel при экспорте (/api/export-charts) — скрипт src/lib/excel/server/export_live_charts.py
+xlsxwriter>=3.1.0

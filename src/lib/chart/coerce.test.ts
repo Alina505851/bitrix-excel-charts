@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatDateDdMmYyyyRuLocal,
+  formatDateTimeDdMmYyyyRuLocal,
   formatDateYmdLocal,
   groupLabel,
   tryParseDate,
@@ -27,6 +29,10 @@ describe("tryParseDate", () => {
     expect(d!.getFullYear()).toBe(2024);
     expect(d!.getMonth()).toBe(2);
     expect(d!.getDate()).toBe(15);
+  });
+
+  it("does not treat dotted date as US month.day (only дд.мм)", () => {
+    expect(tryParseDate("03.15.2024")).toBe(null);
   });
 
   it("parses DD.MM.YYYY HH:mm:ss as day-first local datetime", () => {
@@ -83,15 +89,25 @@ describe("tryParseDate", () => {
     expect(tryParseDate(522)).toBe(null);
   });
 
-  it("does not parse ambiguous slash date", () => {
-    expect(tryParseDate("04/09/2026")).toBe(null);
+  it("parses DD/MM/YYYY and DD-MM-YYYY (день, месяц)", () => {
+    const a = tryParseDate("07/04/2026");
+    expect(a!.getMonth()).toBe(3);
+    expect(a!.getDate()).toBe(7);
+    const b = tryParseDate("07-04-2026");
+    expect(b!.getMonth()).toBe(3);
+    expect(b!.getDate()).toBe(7);
+  });
+
+  it("does not parse slash date with invalid month", () => {
+    expect(tryParseDate("07/13/2026")).toBe(null);
   });
 
   it("returns null for invalid", () => {
     expect(tryParseDate("")).toBe(null);
     expect(tryParseDate("не дата")).toBe(null);
     expect(tryParseDate("31.06.2026 16:32:33")).toBe(null);
-    expect(tryParseDate("07.13.2026 16:32:33")).toBe(null);
+    // Невалидно и как дд.мм, и как мм.дд (месяц > 12 в обоих смыслах)
+    expect(tryParseDate("15.13.2026 16:32:33")).toBe(null);
   });
 });
 
@@ -100,7 +116,9 @@ describe("groupLabel", () => {
     expect(groupLabel(null)).toBe("(пусто)");
     expect(groupLabel("")).toBe("(пусто)");
     const dt = new Date(2024, 0, 10, 12, 0, 0);
-    expect(groupLabel(dt)).toBe("2024-01-10");
+    expect(groupLabel(dt)).toBe("10.01.2024 12:00");
+    const midnight = new Date(2024, 0, 10, 0, 0, 0);
+    expect(groupLabel(midnight)).toBe("10.01.2024");
   });
 
   it("stringifies other values", () => {
@@ -113,5 +131,24 @@ describe("formatDateYmdLocal", () => {
   it("formats date as local YYYY-MM-DD", () => {
     const dt = new Date(2026, 4, 31, 23, 30, 0);
     expect(formatDateYmdLocal(dt)).toBe("2026-05-31");
+  });
+});
+
+describe("formatDateDdMmYyyyRuLocal", () => {
+  it("formats as дд.мм.гггг from local calendar parts", () => {
+    const dt = new Date(2026, 3, 7, 16, 32, 0);
+    expect(formatDateDdMmYyyyRuLocal(dt)).toBe("07.04.2026");
+  });
+});
+
+describe("formatDateTimeDdMmYyyyRuLocal", () => {
+  it("formats date only at local midnight", () => {
+    const dt = new Date(2026, 3, 7, 0, 0, 0, 0);
+    expect(formatDateTimeDdMmYyyyRuLocal(dt)).toBe("07.04.2026");
+  });
+
+  it("adds time when non-midnight", () => {
+    const dt = new Date(2026, 3, 7, 16, 32, 44, 0);
+    expect(formatDateTimeDdMmYyyyRuLocal(dt)).toBe("07.04.2026 16:32:44");
   });
 });

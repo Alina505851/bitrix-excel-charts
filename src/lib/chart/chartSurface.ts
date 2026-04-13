@@ -67,6 +67,8 @@ const ENTITY_CHART_SHELL: Record<EntityBlockId, string> = {
     "min-h-[340px] rounded-xl bg-gradient-to-b from-indigo-100/45 via-violet-50/30 to-cyan-50/20 py-3 px-0.5 ring-1 ring-inset ring-indigo-200/42 dark:from-indigo-950/24 dark:via-violet-950/12 dark:to-zinc-950/52 dark:ring-indigo-500/18",
   quotes:
     "min-h-[340px] rounded-xl bg-gradient-to-b from-rose-100/50 via-rose-50/20 to-white py-3 px-0.5 ring-1 ring-inset ring-rose-200/42 dark:from-rose-950/26 dark:via-rose-950/10 dark:to-zinc-950/50 dark:ring-rose-500/16",
+  generic:
+    "min-h-[340px] rounded-xl bg-gradient-to-b from-slate-100/55 via-zinc-50/30 to-white py-3 px-0.5 ring-1 ring-inset ring-slate-200/45 dark:from-zinc-900/40 dark:via-zinc-950/25 dark:to-zinc-950/55 dark:ring-zinc-600/25",
 };
 
 export function chartShellClass(
